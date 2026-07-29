@@ -1,8 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useRef } from 'react';
 import { Bluetooth, AlertCircle, CheckCircle2, Zap, Power } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { DebugConsole, type DebugMessage } from '@/components/DebugConsole';
-import { parseTelemetry, TelemetryStreamParser, type MotorTelemetry } from '@/lib/telemetry-parser';
+import { BLE_PROFILES, BLE_SERVICE_UUIDS } from '@/lib/ble-profiles';
+import { writeBleCharacteristic } from '@/lib/ble-write';
+import { TelemetryStreamParser, type MotorTelemetry } from '@/lib/telemetry-parser';
 
 // Web Bluetooth API type definitions
 declare global {
@@ -21,20 +23,31 @@ declare global {
   }
   interface BluetoothDevice {
     gatt?: BluetoothRemoteGATTServer;
+    addEventListener(type: 'gattserverdisconnected', listener: () => void): void;
+    removeEventListener(type: 'gattserverdisconnected', listener: () => void): void;
   }
   interface BluetoothRemoteGATTServer {
+    connected: boolean;
     connect(): Promise<BluetoothRemoteGATTServer>;
+    disconnect(): void;
     getPrimaryService(service: string): Promise<BluetoothRemoteGATTService>;
   }
   interface BluetoothRemoteGATTService {
     getCharacteristic(characteristic: string): Promise<BluetoothRemoteGATTCharacteristic>;
   }
   interface BluetoothRemoteGATTCharacteristic {
+    properties?: {
+      read?: boolean;
+      write?: boolean;
+      writeWithoutResponse?: boolean;
+      notify?: boolean;
+    };
     value?: DataView;
     readable?: ReadableStream<Uint8Array>;
     startNotifications(): Promise<void>;
     stopNotifications(): Promise<void>;
     writeValue(value: BufferSource): Promise<void>;
+    writeValueWithoutResponse?(value: BufferSource): Promise<void>;
     addEventListener(type: string, listener: EventListener): void;
   }
 }
@@ -52,10 +65,6 @@ type MotorMode = 'stop' | 'low' | 'high';
  * - Auto-shutoff feature control
  */
 export default function FanController() {
-  // Custom 128-bit UUIDs for Silicon Labs SPP service
-  const SPP_SERVICE_UUID = '4880c12c-fdcb-4077-8920-a450d7f9b907';
-  const SPP_DATA_CHARACTERISTIC_UUID = 'fec26ec4-6d71-4442-9f81-55bc21d658d6';
-
   const [connected, setConnected] = useState(false);
   const [currentMode, setCurrentMode] = useState<MotorMode>('stop');
   const [motorState, setMotorState] = useState<MotorTelemetry>({
@@ -64,18 +73,31 @@ export default function FanController() {
     rpm: 0,
     anomalyPercentage: 0,
     anomalyDetected: false,
+    anomalyActive: false,
     timestamp: Date.now(),
   });
   const [connectionStatus, setConnectionStatus] = useState<string>('Disconnected');
   const [error, setError] = useState<string | null>(null);
   const [autoShutoffEnabled, setAutoShutoffEnabled] = useState(false);
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
+  /** True after at least one full telemetry frame arrived over BLE notifications. */
+  const [telemetryLive, setTelemetryLive] = useState(false);
 
   const characteristicRef = useRef<any>(null);
-  const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
+  const deviceRef = useRef<BluetoothDevice | null>(null);
   const telemetryParserRef = useRef<TelemetryStreamParser>(new TelemetryStreamParser());
-  const abortControllerRef = useRef<AbortController | null>(null);
   const debugMessageIdRef = useRef(0);
+  /** True while the user (or UI) is intentionally tearing down the link. */
+  const intentionalDisconnectRef = useRef(false);
+  /** Stable listener refs so handlers always see the latest logic. */
+  const onGattDisconnectedRef = useRef<() => void>(() => {});
+  const onCharacteristicChangeRef = useRef<(event: Event) => void>(() => {});
+  const gattDisconnectedListener = useRef(() => {
+    onGattDisconnectedRef.current();
+  }).current;
+  const characteristicChangeListener = useRef((event: Event) => {
+    onCharacteristicChangeRef.current(event);
+  }).current;
 
   /**
    * Add a message to the debug console
@@ -100,42 +122,126 @@ export default function FanController() {
   };
 
   /**
+   * Resolve the PM firmware GATT service.
+   * Probe only the UUID that exists on the device — a missing UUID stalls BlueZ ~30s.
+   */
+  const resolveBleProfile = async (server: BluetoothRemoteGATTServer) => {
+    const withTimeout = <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          reject(new Error(`${label} timed out after ${ms}ms`));
+        }, ms);
+        promise.then(
+          (value) => {
+            window.clearTimeout(timer);
+            resolve(value);
+          },
+          (err) => {
+            window.clearTimeout(timer);
+            reject(err);
+          }
+        );
+      });
+
+    const profile = BLE_PROFILES[0];
+    setConnectionStatus('Discovering services…');
+    const service = await withTimeout(
+      server.getPrimaryService(profile.serviceUuid),
+      5000,
+      'SPP service'
+    );
+    const characteristic = await withTimeout(
+      service.getCharacteristic(profile.characteristicUuid),
+      5000,
+      'SPP characteristic'
+    );
+    return { profile, characteristic };
+  };
+
+  /**
+   * Reset UI / refs after the BLE link is gone.
+   */
+  const clearConnectionState = () => {
+    deviceRef.current = null;
+    characteristicRef.current = null;
+    telemetryParserRef.current.reset();
+    setConnected(false);
+    setConnectionStatus('Disconnected');
+    setCurrentMode('stop');
+    setTelemetryLive(false);
+    setMotorState({
+      status: 'Stop',
+      speed: 0,
+      rpm: 0,
+      anomalyPercentage: 0,
+      anomalyDetected: false,
+      anomalyActive: false,
+      timestamp: Date.now(),
+    });
+  };
+
+  /**
+   * Handle unexpected GATT disconnect (device out of range, firmware reset, etc.)
+   */
+  const handleGattDisconnected = () => {
+    const wasIntentional = intentionalDisconnectRef.current;
+    intentionalDisconnectRef.current = false;
+    clearConnectionState();
+    if (!wasIntentional) {
+      setError('BLE connection lost. Reconnect to continue.');
+    }
+  };
+  onGattDisconnectedRef.current = handleGattDisconnected;
+
+  /**
    * Connect to Bluetooth device via Web Bluetooth API
    */
   const connectBluetooth = async () => {
     try {
       setError(null);
+      intentionalDisconnectRef.current = false;
       setConnectionStatus('Scanning...');
 
-      // Request Bluetooth device using custom 128-bit UUIDs
+      // Discover devices advertising the PM SPP service (current or legacy adv UUID)
       const device = await navigator.bluetooth.requestDevice({
-        filters: [
-          { services: [SPP_SERVICE_UUID] },
-        ],
-        optionalServices: [SPP_SERVICE_UUID],
+        filters: BLE_SERVICE_UUIDS.map((uuid) => ({ services: [uuid] })),
+        optionalServices: BLE_SERVICE_UUIDS,
       });
 
       setConnectionStatus('Connecting...');
 
-      // Connect to GATT server
+      // Connect to GATT server and detect which profile the device uses
       const server = await device.gatt!.connect();
-      const service = await server.getPrimaryService(SPP_SERVICE_UUID);
+      // Brief settle so the first ATT request is not issued during conn-param update.
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+      const { characteristic } = await resolveBleProfile(server);
 
-      // Get SPP characteristic (RX/TX)
-      const characteristic = await service.getCharacteristic(SPP_DATA_CHARACTERISTIC_UUID);
+      deviceRef.current = device;
+      device.addEventListener('gattserverdisconnected', gattDisconnectedListener);
 
       characteristicRef.current = characteristic;
+      telemetryParserRef.current.reset();
+      setTelemetryLive(false);
 
-      // Start listening for notifications
+      // Register before enabling CCCD so the immediate firmware snapshot is not missed.
+      setConnectionStatus('Enabling notifications…');
+      characteristic.addEventListener('characteristicvaluechanged', characteristicChangeListener);
       await characteristic.startNotifications();
-      characteristic.addEventListener('characteristicvaluechanged', handleCharacteristicChange);
 
       setConnected(true);
       setConnectionStatus('Connected');
       setCurrentMode('stop');
+      setMotorState({
+        status: 'Stop',
+        speed: 0,
+        rpm: 0,
+        anomalyPercentage: 0,
+        anomalyDetected: false,
+        anomalyActive: false,
+        timestamp: Date.now(),
+      });
 
-      // Start reading from the characteristic
-      startReading(characteristic);
+      // Telemetry updates from characteristicvaluechanged as Motor: frames arrive.
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Connection failed';
       setError(errorMsg);
@@ -145,58 +251,58 @@ export default function FanController() {
   };
 
   /**
-   * Start reading from BLE characteristic using Web Streams API
+   * Apply parsed telemetry from BLE notifications to the Real-Time Telemetry panel.
    */
-  const startReading = async (characteristic: any) => {
-    try {
-      const reader = characteristic.readable?.getReader();
-      if (!reader) return;
+  const applyTelemetry = (telemetry: MotorTelemetry) => {
+    setTelemetryLive(true);
+    setMotorState(telemetry);
 
-      readerRef.current = reader;
-      abortControllerRef.current = new AbortController();
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        // Feed data into the telemetry parser
-        const telemetryFrames = telemetryParserRef.current.feed(value);
-
-        // Process all parsed frames
-        for (const telemetry of telemetryFrames) {
-          setMotorState(telemetry);
-        }
-      }
-    } catch (err) {
-      if (!(err instanceof Error && err.message.includes('aborted'))) {
-        console.error('Reading error:', err);
-      }
+    const absSpeed = Math.abs(telemetry.speed);
+    if (telemetry.status === 'Stop' || absSpeed < 1) {
+      setCurrentMode('stop');
+    } else if (absSpeed >= 150) {
+      setCurrentMode('high');
+    } else {
+      setCurrentMode('low');
     }
   };
 
   /**
-   * Handle characteristic value changes (notifications)
+   * Handle characteristic value changes (notifications).
+   * Apply telemetry before debug logging so the panel updates first.
    */
   const handleCharacteristicChange = (event: Event) => {
+    if (intentionalDisconnectRef.current) {
+      return;
+    }
     const characteristic = event.target as any;
-    const value = characteristic.value;
+    const value = characteristic.value as DataView | undefined;
     if (value) {
-      // Log raw data
-      const rawData = new Uint8Array(value.buffer);
-      const dataStr = new TextDecoder().decode(rawData).trim();
-      if (dataStr) {
-        addDebugMessage('received', dataStr, rawData);
+      // DataView may share a larger ArrayBuffer — slice the exact GATT payload.
+      const rawData = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+
+      const telemetryFrames = telemetryParserRef.current.feed(rawData);
+      for (const telemetry of telemetryFrames) {
+        applyTelemetry(telemetry);
       }
 
-      // Feed data into the telemetry parser
-      const telemetryFrames = telemetryParserRef.current.feed(value);
-
-      // Process all parsed frames
-      for (const telemetry of telemetryFrames) {
-        setMotorState(telemetry);
+      // Log complete frames when available; otherwise show the raw chunk.
+      if (telemetryFrames.length > 0) {
+        for (const telemetry of telemetryFrames) {
+          addDebugMessage(
+            'received',
+            `Motor: ${telemetry.status}  Speed: ${telemetry.speed.toFixed(2)} Anomaly: ${telemetry.anomalyPercentage}%`
+          );
+        }
+      } else {
+        const dataStr = new TextDecoder().decode(rawData);
+        if (dataStr.trim()) {
+          addDebugMessage('received', dataStr.trim(), rawData);
+        }
       }
     }
   };
+  onCharacteristicChangeRef.current = handleCharacteristicChange;
 
   /**
    * Send command to motor control board
@@ -211,15 +317,21 @@ export default function FanController() {
       const encoder = new TextEncoder();
       const data = encoder.encode(command + '\n');
       addDebugMessage('sent', command);
-      await characteristicRef.current.writeValue(data);
+      await writeBleCharacteristic(characteristicRef.current, data);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Failed to send command';
       setError(errorMsg);
+      if (errorMsg.includes('disconnected') || errorMsg.includes('GATT')) {
+        setConnected(false);
+        setConnectionStatus('Disconnected');
+        characteristicRef.current = null;
+      }
     }
   };
 
   /**
-   * Control motor mode
+   * Control motor mode — sends the command only.
+   * Real-Time Telemetry is updated solely from BLE notifications after connect.
    */
   const setMotorMode = async (mode: MotorMode) => {
     let command = '';
@@ -229,13 +341,14 @@ export default function FanController() {
         command = 'M0';
         break;
       case 'low':
-        command = 'M7';
+        command = 'M50';
         break;
       case 'high':
-        command = 'M16';
+        command = 'M250';
         break;
     }
 
+    // Highlight the pressed control; telemetry panel follows device notify stream.
     setCurrentMode(mode);
     await sendCommand(command);
   };
@@ -256,31 +369,55 @@ export default function FanController() {
   };
 
   /**
-   * Disconnect from Bluetooth device
+   * Disconnect from Bluetooth device.
+   * Drops the GATT link immediately; gattserverdisconnected clears UI state.
    */
-  const disconnectBluetooth = async () => {
-    try {
-      if (readerRef.current) {
-        await readerRef.current.cancel();
-      }
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-      if (characteristicRef.current) {
-        await characteristicRef.current.stopNotifications();
-      }
+  const disconnectBluetooth = () => {
+    const device = deviceRef.current;
+    const characteristic = characteristicRef.current;
+    if (!device && !connected) {
+      clearConnectionState();
+      return;
+    }
 
-      setConnected(false);
-      setConnectionStatus('Disconnected');
-      characteristicRef.current = null;
-      readerRef.current = null;
-      telemetryParserRef.current.reset();
+    setError(null);
+    intentionalDisconnectRef.current = true;
+
+    // Update UI immediately — do not wait on stopNotifications (can hang on Linux).
+    setConnected(false);
+    setConnectionStatus('Disconnected');
+
+    if (characteristic) {
+      try {
+        characteristic.removeEventListener('characteristicvaluechanged', characteristicChangeListener);
+      } catch {
+        // Ignore.
+      }
+    }
+
+    try {
+      if (device) {
+        device.removeEventListener('gattserverdisconnected', gattDisconnectedListener);
+      }
+      // Drop the BLE link right away. skip awaiting CCCD clear — disconnect tears it down.
+      if (device?.gatt?.connected) {
+        device.gatt.disconnect();
+      }
     } catch (err) {
       console.error('Disconnect error:', err);
+    } finally {
+      // Always clear locally; intentional flag suppresses the "connection lost" error
+      // if gattserverdisconnected also fires.
+      intentionalDisconnectRef.current = true;
+      clearConnectionState();
+      // Keep flag true briefly so a late gattserverdisconnected does not show an error,
+      // then clear it on the next tick.
+      window.setTimeout(() => {
+        intentionalDisconnectRef.current = false;
+      }, 500);
     }
   };
 
-  // Check Web Bluetooth support
   const bluetoothSupported = 'bluetooth' in navigator;
 
   return (
@@ -293,7 +430,9 @@ export default function FanController() {
               <Zap className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h1 className="text-xl font-bold text-primary">Silicon Labs MG24</h1>
+              <h1 className="text-xl font-bold text-primary">
+                Motor BLE Controller
+              </h1>
               <p className="text-xs text-muted-foreground">Motor Control Demo</p>
             </div>
           </div>
@@ -301,7 +440,9 @@ export default function FanController() {
           <div className="flex items-center gap-2">
             <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${connected ? 'bg-green-50' : 'bg-red-50'}`}>
               <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
-              <span className="text-sm font-medium text-foreground">{connectionStatus}</span>
+              <span className="text-sm font-medium text-foreground">
+                {connected ? 'Connected' : connectionStatus}
+              </span>
             </div>
           </div>
         </div>
@@ -399,7 +540,7 @@ export default function FanController() {
                         : 'bg-green-100 text-green-700 hover:bg-green-200'
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
-                    <span className="text-lg">🌀</span> Low (10 rad/s)
+                    <span className="text-lg">🌀</span> Low (50 rad/s)
                   </button>
 
                   {/* High Speed Button */}
@@ -412,7 +553,7 @@ export default function FanController() {
                         : 'bg-accent/10 text-accent hover:bg-accent/20'
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
-                    <span className="text-lg">⚡</span> High (20 rad/s)
+                    <span className="text-lg">⚡</span> High (250 rad/s)
                   </button>
                 </div>
 
@@ -444,10 +585,25 @@ export default function FanController() {
               </div>
             </div>
 
-            {/* Right: Telemetry Display */}
+            {/* Right: Telemetry Display — driven by BLE notifications after connect */}
             <div className="lg:col-span-1">
               <div className="bg-white rounded-xl p-8 shadow-sm border border-border">
                 <h2 className="text-lg font-bold text-primary mb-6 text-center">Real-Time Telemetry</h2>
+                <div className="mb-6 flex items-center justify-center gap-2 text-xs font-medium">
+                  {connected && telemetryLive ? (
+                    <>
+                      <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                      <span className="text-green-700">Live via BLE notify</span>
+                    </>
+                  ) : connected ? (
+                    <>
+                      <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                      <span className="text-amber-700">Waiting for device telemetry…</span>
+                    </>
+                  ) : (
+                    <span className="text-muted-foreground">Connect to stream telemetry</span>
+                  )}
+                </div>
 
                 {/* Status Indicator */}
                 <div className="mb-8">
@@ -461,7 +617,9 @@ export default function FanController() {
                           : 'bg-muted'
                     }`} />
                   </div>
-                  <p className="text-2xl font-bold text-primary">{motorState.status}</p>
+                  <p className="text-2xl font-bold text-primary">
+                    {telemetryLive ? motorState.status : '—'}
+                  </p>
                 </div>
 
                 {/* Speed Display */}
@@ -469,10 +627,10 @@ export default function FanController() {
                   <p className="text-sm font-medium text-muted-foreground mb-2">Speed</p>
                   <div className="bg-secondary/50 rounded-lg p-4">
                     <p className="text-3xl font-mono font-bold text-accent">
-                      {motorState.rpm.toFixed(0)} RPM
+                      {telemetryLive ? `${motorState.rpm.toFixed(0)} RPM` : '— RPM'}
                     </p>
                     <p className="text-xs text-muted-foreground mt-1">
-                      {motorState.speed.toFixed(2)} rad/s
+                      {telemetryLive ? `${motorState.speed.toFixed(2)} rad/s` : '— rad/s'}
                     </p>
                   </div>
                 </div>
@@ -482,7 +640,7 @@ export default function FanController() {
                   <div className="flex items-center justify-between mb-3">
                     <span className="text-sm font-medium text-muted-foreground">Anomaly Detection</span>
                     <div className={`status-led ${motorState.anomalyDetected ? 'active' : ''} ${
-                      !motorState.anomalyActive ? 'bg-muted' :
+                      !telemetryLive || !motorState.anomalyActive ? 'bg-muted' :
                         motorState.anomalyDetected ? 'bg-yellow-500' : 'bg-green-500'
                     }`} />
                   </div>
@@ -491,10 +649,16 @@ export default function FanController() {
                   <div className="mb-3">
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-2xl font-mono font-bold text-foreground">
-                        {motorState.anomalyPercentage}%
+                        {telemetryLive ? `${motorState.anomalyPercentage}%` : '—'}
                       </span>
                       <span className="text-xs font-medium text-muted-foreground">
-                        {motorState.anomalyPercentage < 30 ? 'Normal' : motorState.anomalyPercentage < 70 ? 'Warning' : 'Critical'}
+                        {!telemetryLive
+                          ? 'Pending'
+                          : motorState.anomalyPercentage < 30
+                            ? 'Normal'
+                            : motorState.anomalyPercentage < 70
+                              ? 'Warning'
+                              : 'Critical'}
                       </span>
                     </div>
                     
@@ -509,21 +673,28 @@ export default function FanController() {
                               : 'bg-red-500'
                         }`}
                         style={{
-                          width: `${motorState.anomalyPercentage}%`,
+                          width: `${telemetryLive ? motorState.anomalyPercentage : 0}%`,
                         }}
                       />
                     </div>
                   </div>
                   
                   <p className="text-xs text-muted-foreground">
-                    {motorState.anomalyDetected ? '⚠️ Anomaly Detected' : '✓ Normal Operation'}
+                    {!telemetryLive
+                      ? 'Telemetry starts when BLE notifications deliver Motor: frames'
+                      : motorState.anomalyDetected
+                        ? '⚠️ Anomaly Detected'
+                        : '✓ Normal Operation'}
                   </p>
                 </div>
 
                 {/* Last Update */}
                 <div className="pt-4 border-t border-border">
                   <p className="text-xs text-muted-foreground">
-                    Last update: {new Date(motorState.timestamp).toLocaleTimeString()}
+                    Last update:{' '}
+                    {telemetryLive
+                      ? new Date(motorState.timestamp).toLocaleTimeString()
+                      : '—'}
                   </p>
                 </div>
               </div>
