@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Bluetooth, AlertCircle, CheckCircle2, Zap, Power } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { DebugConsole, type DebugMessage } from '@/components/DebugConsole';
@@ -52,17 +52,23 @@ declare global {
   }
 }
 
-type MotorMode = 'stop' | 'low' | 'high';
+type MotorMode = 'stop' | 'low' | 'high' | 'custom';
+
+/** Firmware accepts motor speed refs in 0..300 rad/s (legacy BLE: M<n>, M0 = stop). */
+const MOTOR_SPEED_MIN_RAD_S = 0;
+const MOTOR_SPEED_MAX_RAD_S = 300;
+
+/** How long transient error banners stay visible before auto-dismiss. */
+const ERROR_DISMISS_MS = 5000;
 
 /**
  * FanController Component
- * 
- * Web Bluetooth SPP interface for Silicon Labs MG24 motor control demo
+ *
+ * Web Bluetooth SPP interface for Silicon Labs SiWG917 motor control demo
  * Demonstrates integration of:
  * - Bluetooth Connectivity (Web Bluetooth SPP)
- * - Motor Control (PWM-based speed regulation)
+ * - Motor Control (speed reference commands)
  * - Anomaly Detection (AI/ML edge processing)
- * - Auto-shutoff feature control
  */
 export default function FanController() {
   const [connected, setConnected] = useState(false);
@@ -76,7 +82,7 @@ export default function FanController() {
   });
   const [connectionStatus, setConnectionStatus] = useState<string>('Disconnected');
   const [error, setError] = useState<string | null>(null);
-  const [autoShutoffEnabled, setAutoShutoffEnabled] = useState(false);
+  const [customSpeedInput, setCustomSpeedInput] = useState('100');
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
   /** True after at least one full telemetry frame arrived over BLE notifications. */
   const [telemetryLive, setTelemetryLive] = useState(false);
@@ -85,8 +91,36 @@ export default function FanController() {
   const deviceRef = useRef<BluetoothDevice | null>(null);
   const telemetryParserRef = useRef<TelemetryStreamParser>(new TelemetryStreamParser());
   const debugMessageIdRef = useRef(0);
+  const errorDismissTimerRef = useRef<number | null>(null);
   /** True while the user (or UI) is intentionally tearing down the link. */
   const intentionalDisconnectRef = useRef(false);
+
+  const clearError = useCallback(() => {
+    if (errorDismissTimerRef.current !== null) {
+      window.clearTimeout(errorDismissTimerRef.current);
+      errorDismissTimerRef.current = null;
+    }
+    setError(null);
+  }, []);
+
+  const showError = useCallback((message: string, durationMs: number = ERROR_DISMISS_MS) => {
+    if (errorDismissTimerRef.current !== null) {
+      window.clearTimeout(errorDismissTimerRef.current);
+    }
+    setError(message);
+    errorDismissTimerRef.current = window.setTimeout(() => {
+      errorDismissTimerRef.current = null;
+      clearError();
+    }, durationMs);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (errorDismissTimerRef.current !== null) {
+        window.clearTimeout(errorDismissTimerRef.current);
+      }
+    };
+  }, []);
   /** Stable listener refs so handlers always see the latest logic. */
   const onGattDisconnectedRef = useRef<() => void>(() => {});
   const onCharacteristicChangeRef = useRef<(event: Event) => void>(() => {});
@@ -184,7 +218,7 @@ export default function FanController() {
     intentionalDisconnectRef.current = false;
     clearConnectionState();
     if (!wasIntentional) {
-      setError('BLE connection lost. Reconnect to continue.');
+      showError('BLE connection lost. Reconnect to continue.');
     }
   };
   onGattDisconnectedRef.current = handleGattDisconnected;
@@ -194,7 +228,7 @@ export default function FanController() {
    */
   const connectBluetooth = async () => {
     try {
-      setError(null);
+      clearError();
       intentionalDisconnectRef.current = false;
       setConnectionStatus('Scanning...');
 
@@ -238,7 +272,7 @@ export default function FanController() {
       // Telemetry updates from characteristicvaluechanged as Motor: frames arrive.
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Connection failed';
-      setError(errorMsg);
+      showError(errorMsg);
       setConnectionStatus('Disconnected');
       setConnected(false);
     }
@@ -254,10 +288,12 @@ export default function FanController() {
     const absSpeed = Math.abs(telemetry.speed);
     if (telemetry.status === 'Stop' || absSpeed < 1) {
       setCurrentMode('stop');
-    } else if (absSpeed >= 150) {
+    } else if (Math.abs(absSpeed - 50) <= 5) {
+      setCurrentMode('low');
+    } else if (Math.abs(absSpeed - 250) <= 5) {
       setCurrentMode('high');
     } else {
-      setCurrentMode('low');
+      setCurrentMode('custom');
     }
   };
 
@@ -303,7 +339,7 @@ export default function FanController() {
    */
   const sendCommand = async (command: string) => {
     if (!characteristicRef.current || !connected) {
-      setError('Not connected to device');
+      showError('Not connected to device');
       return;
     }
 
@@ -314,7 +350,7 @@ export default function FanController() {
       await writeBleCharacteristic(characteristicRef.current, data);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Failed to send command';
-      setError(errorMsg);
+      showError(errorMsg);
       if (errorMsg.includes('disconnected') || errorMsg.includes('GATT')) {
         setConnected(false);
         setConnectionStatus('Disconnected');
@@ -327,7 +363,7 @@ export default function FanController() {
    * Control motor mode — sends the command only.
    * Real-Time Telemetry is updated solely from BLE notifications after connect.
    */
-  const setMotorMode = async (mode: MotorMode) => {
+  const setMotorMode = async (mode: Exclude<MotorMode, 'custom'>) => {
     let command = '';
 
     switch (mode) {
@@ -344,22 +380,30 @@ export default function FanController() {
 
     // Highlight the pressed control; telemetry panel follows device notify stream.
     setCurrentMode(mode);
+    clearError();
     await sendCommand(command);
   };
 
   /**
-   * Toggle auto-shutoff feature
+   * Set an arbitrary speed reference (rad/s) via legacy BLE M<n> (speed + start).
+   * Firmware range: 0..300 rad/s (M0 stops, M<n> sets speed + start).
    */
-  const toggleAutoShutoff = async () => {
-    const newState = !autoShutoffEnabled;
-    const command = newState ? 'AOFF1' : 'AOFF0';
-
-    try {
-      await sendCommand(command);
-      setAutoShutoffEnabled(newState);
-    } catch (err) {
-      setError(`Failed to ${newState ? 'enable' : 'disable'} auto-shutoff`);
+  const setCustomSpeed = async () => {
+    const speed = Number.parseInt(customSpeedInput.trim(), 10);
+    if (
+      !Number.isFinite(speed)
+      || speed < MOTOR_SPEED_MIN_RAD_S
+      || speed > MOTOR_SPEED_MAX_RAD_S
+    ) {
+      showError(
+        `Enter a speed between ${MOTOR_SPEED_MIN_RAD_S} and ${MOTOR_SPEED_MAX_RAD_S} rad/s`
+      );
+      return;
     }
+
+    clearError();
+    setCurrentMode(speed === 0 ? 'stop' : 'custom');
+    await sendCommand(`M${speed}`);
   };
 
   /**
@@ -374,7 +418,7 @@ export default function FanController() {
       return;
     }
 
-    setError(null);
+    clearError();
     intentionalDisconnectRef.current = true;
 
     // Update UI immediately — do not wait on stopNotifications (can hang on Linux).
@@ -561,31 +605,73 @@ export default function FanController() {
                   >
                     <span className="text-lg">⚡</span> High (250 rad/s)
                   </button>
+
+                  {/* Custom Speed */}
+                  <div
+                    className={`rounded-xl border p-4 transition-all ${
+                      currentMode === 'custom'
+                        ? 'border-primary bg-primary/5 shadow-sm'
+                        : 'border-border bg-secondary/30'
+                    }`}
+                  >
+                    <label
+                      htmlFor="custom-speed"
+                      className="mb-2 block text-sm font-medium text-foreground"
+                    >
+                      Custom speed (rad/s)
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        id="custom-speed"
+                        type="number"
+                        min={MOTOR_SPEED_MIN_RAD_S}
+                        max={MOTOR_SPEED_MAX_RAD_S}
+                        step={1}
+                        value={customSpeedInput}
+                        onChange={(e) => setCustomSpeedInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            void setCustomSpeed();
+                          }
+                        }}
+                        disabled={!connected}
+                        className="w-full rounded-lg border border-border bg-white px-3 py-2 font-mono text-sm text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
+                        placeholder="e.g. 100"
+                      />
+                      <Button
+                        onClick={() => void setCustomSpeed()}
+                        disabled={!connected}
+                        className="shrink-0 tech-button bg-primary hover:bg-primary/90 text-primary-foreground"
+                      >
+                        Set
+                      </Button>
+                    </div>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Range {MOTOR_SPEED_MIN_RAD_S}–{MOTOR_SPEED_MAX_RAD_S} rad/s (M0 = stop)
+                    </p>
+                  </div>
                 </div>
 
-                {/* Auto-Shutoff Toggle */}
-                <div className="mt-8 pt-8 border-t border-border">
+                {/* Auto-Shutoff Toggle — UI retained; feature not on device yet */}
+                <div className="mt-8 pt-8 border-t border-border opacity-70">
                   <div className="flex items-center justify-between mb-4">
                     <div className="flex items-center gap-2">
                       <Power className="w-5 h-5 text-primary" />
                       <span className="font-medium text-foreground">Auto-Shutoff</span>
                     </div>
                     <button
-                      onClick={toggleAutoShutoff}
-                      disabled={!connected}
-                      className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ${
-                        autoShutoffEnabled ? 'bg-accent' : 'bg-gray-300'
-                      } disabled:opacity-50 disabled:cursor-not-allowed`}
+                      type="button"
+                      disabled
+                      aria-disabled="true"
+                      title="Not available on device yet"
+                      className="relative inline-flex h-8 w-14 cursor-not-allowed items-center rounded-full bg-gray-300 opacity-60"
                     >
-                      <span
-                        className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
-                          autoShutoffEnabled ? 'translate-x-7' : 'translate-x-1'
-                        }`}
-                      />
+                      <span className="inline-block h-6 w-6 translate-x-1 transform rounded-full bg-white" />
                     </button>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    {autoShutoffEnabled ? 'Auto-shutoff enabled' : 'Auto-shutoff disabled'}
+                    Auto-shutoff disabled — not available on device yet
                   </p>
                 </div>
               </div>
