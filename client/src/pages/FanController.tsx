@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button';
 import { DebugConsole, type DebugMessage } from '@/components/DebugConsole';
 import { BLE_PROFILES, BLE_SERVICE_UUIDS } from '@/lib/ble-profiles';
 import { writeBleCharacteristic } from '@/lib/ble-write';
-import { TelemetryStreamParser, type MotorTelemetry } from '@/lib/telemetry-parser';
+import { TelemetryStreamParser, type MotorTelemetry, anomalyLabel } from '@/lib/telemetry-parser';
 
 // Web Bluetooth API type definitions
 declare global {
@@ -71,9 +71,7 @@ export default function FanController() {
     status: 'Stop',
     speed: 0,
     rpm: 0,
-    anomalyPercentage: 0,
-    anomalyDetected: false,
-    anomalyActive: false,
+    anomaly: 'NORMAL',
     timestamp: Date.now(),
   });
   const [connectionStatus, setConnectionStatus] = useState<string>('Disconnected');
@@ -173,9 +171,7 @@ export default function FanController() {
       status: 'Stop',
       speed: 0,
       rpm: 0,
-      anomalyPercentage: 0,
-      anomalyDetected: false,
-      anomalyActive: false,
+      anomaly: 'NORMAL',
       timestamp: Date.now(),
     });
   };
@@ -235,9 +231,7 @@ export default function FanController() {
         status: 'Stop',
         speed: 0,
         rpm: 0,
-        anomalyPercentage: 0,
-        anomalyDetected: false,
-        anomalyActive: false,
+        anomaly: 'NORMAL',
         timestamp: Date.now(),
       });
 
@@ -291,7 +285,7 @@ export default function FanController() {
         for (const telemetry of telemetryFrames) {
           addDebugMessage(
             'received',
-            `Motor: ${telemetry.status}  Speed: ${telemetry.speed.toFixed(2)} Anomaly: ${telemetry.anomalyPercentage}%`
+            `Motor: ${telemetry.status}  Speed: ${telemetry.speed.toFixed(2)} Anomaly: ${telemetry.anomaly}`
           );
         }
       } else {
@@ -455,7 +449,19 @@ export default function FanController() {
             <AlertCircle className="w-12 h-12 text-destructive mx-auto mb-4" />
             <h2 className="text-2xl font-bold text-foreground mb-2">Web Bluetooth Not Supported</h2>
             <p className="text-muted-foreground mb-4">
-              Your browser does not support the Web Bluetooth API. Please use Chrome, Edge, or Opera on a device with Bluetooth hardware.
+              This view has no Web Bluetooth API (Cursor Simple Browser and many embedded
+              browsers do not). On Linux, open the app with the dedicated Chrome launcher
+              so experimental Web Bluetooth flags are enabled:
+            </p>
+            <pre className="text-left text-sm bg-muted rounded-lg p-4 mb-4 overflow-x-auto">
+{`./scripts/start-dev.sh          # Vite on :3000 if not already running
+./scripts/start-chrome-linux.sh # Chrome with WebBluetooth flags`}
+            </pre>
+            <p className="text-muted-foreground mb-4">
+              Use that Chrome window (profile under{" "}
+              <code>~/.config/motor-ble-controller-chrome</code>), not Cursor&apos;s
+              built-in browser. On Windows remotes, open system Chrome to{" "}
+              <code>http://localhost:3000/motor-ble-controller/</code>.
             </p>
           </div>
         ) : (
@@ -639,52 +645,48 @@ export default function FanController() {
                 <div className="mb-4">
                   <div className="flex items-center justify-between mb-3">
                     <span className="text-sm font-medium text-muted-foreground">Anomaly Detection</span>
-                    <div className={`status-led ${motorState.anomalyDetected ? 'active' : ''} ${
-                      !telemetryLive || !motorState.anomalyActive ? 'bg-muted' :
-                        motorState.anomalyDetected ? 'bg-yellow-500' : 'bg-green-500'
-                    }`} />
+                    <div
+                      className={`status-led ${
+                        !telemetryLive
+                          ? 'bg-muted'
+                          : motorState.anomaly === 'BLOCKED'
+                            ? 'bg-red-500 active'
+                            : motorState.anomaly === 'SLOWED'
+                              ? 'bg-yellow-500 active'
+                              : 'bg-green-500'
+                      }`}
+                    />
                   </div>
-                  
-                  {/* Anomaly Meter Bar */}
-                  <div className="mb-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-2xl font-mono font-bold text-foreground">
-                        {telemetryLive ? `${motorState.anomalyPercentage}%` : '—'}
-                      </span>
-                      <span className="text-xs font-medium text-muted-foreground">
-                        {!telemetryLive
-                          ? 'Pending'
-                          : motorState.anomalyPercentage < 30
-                            ? 'Normal'
-                            : motorState.anomalyPercentage < 70
-                              ? 'Warning'
-                              : 'Critical'}
-                      </span>
-                    </div>
-                    
-                    {/* Progress Bar */}
-                    <div className="w-full h-3 bg-gray-200 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full transition-all duration-300 ${
-                          motorState.anomalyPercentage < 30
-                            ? 'bg-green-500'
-                            : motorState.anomalyPercentage < 70
-                              ? 'bg-yellow-500'
-                              : 'bg-red-500'
-                        }`}
-                        style={{
-                          width: `${telemetryLive ? motorState.anomalyPercentage : 0}%`,
-                        }}
-                      />
-                    </div>
+
+                  <div className="bg-secondary/50 rounded-lg p-4 mb-3">
+                    <p
+                      className={`text-2xl font-bold tracking-wide ${
+                        !telemetryLive
+                          ? 'text-muted-foreground'
+                          : motorState.anomaly === 'BLOCKED'
+                            ? 'text-red-600'
+                            : motorState.anomaly === 'SLOWED'
+                              ? 'text-yellow-600'
+                              : 'text-green-600'
+                      }`}
+                    >
+                      {telemetryLive ? motorState.anomaly : '—'}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {!telemetryLive
+                        ? 'Pending telemetry'
+                        : anomalyLabel(motorState.anomaly)}
+                    </p>
                   </div>
-                  
+
                   <p className="text-xs text-muted-foreground">
                     {!telemetryLive
                       ? 'Telemetry starts when BLE notifications deliver Motor: frames'
-                      : motorState.anomalyDetected
-                        ? '⚠️ Anomaly Detected'
-                        : '✓ Normal Operation'}
+                      : motorState.anomaly === 'NORMAL'
+                        ? '✓ Normal Operation'
+                        : motorState.anomaly === 'SLOWED'
+                          ? '⚠️ Fan running slower than expected'
+                          : '⛔ Fan blocked or stalled'}
                   </p>
                 </div>
 
