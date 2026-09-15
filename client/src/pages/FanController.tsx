@@ -54,8 +54,8 @@ declare global {
 
 type MotorMode = 'stop' | 'low' | 'high' | 'custom';
 
-/** Firmware accepts motor speed refs in 0..300 rad/s (legacy BLE: M<n>, M0 = stop). */
-const MOTOR_SPEED_MIN_RAD_S = 0;
+/** Firmware accepts motor speed refs in -300..300 rad/s (legacy BLE: M<n>, M0 = stop; negative = reverse). */
+const MOTOR_SPEED_MIN_RAD_S = -300;
 const MOTOR_SPEED_MAX_RAD_S = 300;
 
 /** How long transient error banners stay visible before auto-dismiss. */
@@ -386,7 +386,7 @@ export default function FanController() {
 
   /**
    * Set an arbitrary speed reference (rad/s) via legacy BLE M<n> (speed + start).
-   * Firmware range: 0..300 rad/s (M0 stops, M<n> sets speed + start).
+   * Firmware range: -300..300 rad/s (M0 stops, M<n> sets speed + start; negative = reverse).
    */
   const setCustomSpeed = async () => {
     const speed = Number.parseInt(customSpeedInput.trim(), 10);
@@ -637,7 +637,7 @@ export default function FanController() {
                         }}
                         disabled={!connected}
                         className="w-full rounded-lg border border-border bg-white px-3 py-2 font-mono text-sm text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
-                        placeholder="e.g. 100"
+                        placeholder="e.g. 100 or -100"
                       />
                       <Button
                         onClick={() => void setCustomSpeed()}
@@ -648,7 +648,7 @@ export default function FanController() {
                       </Button>
                     </div>
                     <p className="mt-2 text-xs text-muted-foreground">
-                      Range {MOTOR_SPEED_MIN_RAD_S}–{MOTOR_SPEED_MAX_RAD_S} rad/s (M0 = stop)
+                      Range {MOTOR_SPEED_MIN_RAD_S}–{MOTOR_SPEED_MAX_RAD_S} rad/s (negative = reverse, M0 = stop)
                     </p>
                   </div>
                 </div>
