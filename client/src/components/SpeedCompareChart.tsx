@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react';
+import { memo, useCallback, useMemo, useRef } from 'react';
 import { Download } from 'lucide-react';
 import {
   CartesianGrid,
@@ -62,15 +62,19 @@ function downloadBlob(blob: Blob, filename: string) {
 
 /**
  * Live line chart: Fan Control target vs actual BLE/sim telemetry (rad/s).
+ * Uses linear paths (not monotone) — monotone cubic fits are costly on noisy high-rate data.
  */
-export function SpeedCompareChart({
+export const SpeedCompareChart = memo(function SpeedCompareChart({
   data,
   commandedSpeed,
   className = '',
 }: SpeedCompareChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
   const latestActual = data.length > 0 ? data[data.length - 1].actual : null;
-  const yDomain = data.length > 0 ? yDomainFromData(data) : undefined;
+  const yDomain = useMemo(
+    () => (data.length > 0 ? yDomainFromData(data) : undefined),
+    [data]
+  );
 
   const exportChart = useCallback(async () => {
     if (data.length === 0) {
@@ -196,8 +200,10 @@ export function SpeedCompareChart({
               <CartesianGrid strokeDasharray="3 3" className="stroke-border" />
               <XAxis
                 dataKey="t"
+                type="number"
+                domain={['dataMin', 'dataMax']}
                 tickFormatter={formatTime}
-                minTickGap={40}
+                minTickGap={48}
                 tick={{ fontSize: 10 }}
               />
               <YAxis
@@ -210,7 +216,7 @@ export function SpeedCompareChart({
               <Tooltip
                 labelFormatter={(label) => formatTime(Number(label))}
                 formatter={(value: number, name: string) => [
-                  `${value.toFixed(2)} rad/s`,
+                  `${Number(value).toFixed(2)} rad/s`,
                   name === 'commanded' ? 'Target' : 'Actual',
                 ]}
               />
@@ -225,15 +231,17 @@ export function SpeedCompareChart({
                 stroke="#ef4444"
                 strokeWidth={2}
                 dot={false}
+                activeDot={false}
                 isAnimationActive={false}
               />
               <Line
-                type="monotone"
+                type="linear"
                 dataKey="actual"
                 name="actual"
                 stroke="#0ea5e9"
-                strokeWidth={2.5}
+                strokeWidth={2}
                 dot={false}
+                activeDot={{ r: 3 }}
                 isAnimationActive={false}
               />
             </LineChart>
@@ -242,4 +250,4 @@ export function SpeedCompareChart({
       </div>
     </div>
   );
-}
+});

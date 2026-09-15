@@ -3,11 +3,12 @@
  *
  * Parses telemetry messages from Silicon Labs motor control boards.
  *
- * Message format:
+ * Message formats:
  * "Motor: <status>  Speed: <speed> Anomaly: <NORMAL|SLOWED|BLOCKED>\n"
+ * "Motor: <status>  Speed: <speed> Anomaly: <0-100>%\n"
+ * "Motor: <status>  Speed: <speed> Anomaly: <0-100>\n"  (bare int; common on device)
  *
- * Legacy firmware may still send percentage values (0/60/90); those are mapped
- * to the same three states for backward compatibility.
+ * Legacy percentage values (0/60/90) map to the three discrete states.
  *
  * BLE SPP notifies are often chunked (~20 bytes). Firmware may also abort a
  * multi-chunk send when a new command arrives, so the stream parser must
@@ -28,9 +29,12 @@ export interface MotorTelemetry {
 const TELEMETRY_STATE_FRAME_RE =
   /Motor:\s*(Running|Stop|Error)\s+Speed:\s*([-+]?\d+(?:\.\d+)?)\s+Anomaly:\s*(NORMAL|SLOWED|BLOCKED)/i;
 
-/** Legacy percentage-based frames (pre–three-state BLE format). */
+/**
+ * Legacy / device percentage frames.
+ * Accepts `Anomaly: 0`, `Anomaly: 0%`, and optional `mode: imu|audio`.
+ */
 const TELEMETRY_PERCENT_FRAME_RE =
-  /Motor:\s*(Running|Stop|Error)\s+Speed:\s*([-+]?\d+(?:\.\d+)?)\s+Anomaly:\s*(\d+)\s*%(?:\s+mode:\s*(imu|audio))?/i;
+  /Motor:\s*(Running|Stop|Error)\s+Speed:\s*([-+]?\d+(?:\.\d+)?)\s+Anomaly:\s*(\d+)\s*%?(?:\s+mode:\s*(imu|audio))?/i;
 
 export function percentToAnomalyState(percent: number): AnomalyState {
   if (percent >= 80) {

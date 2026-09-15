@@ -21,7 +21,10 @@ import {
   type SimMotorMode,
 } from '@/lib/telemetry-simulator';
 
-const SPEED_HISTORY_MAX = 120;
+/** Max points kept for Speed Compare (SVG redraw cost scales with this). */
+const SPEED_HISTORY_MAX = 90;
+/** Cap chart React updates — firmware often notifies faster at high RPM. */
+const SPEED_CHART_MIN_INTERVAL_MS = 100;
 
 // Web Bluetooth API type definitions
 declare global {
@@ -125,6 +128,8 @@ export default function FanController() {
   const simTargetModeRef = useRef<SimMotorMode>('stop');
   const simCustomSpeedRef = useRef(100);
   const commandedSpeedRef = useRef(0);
+  const lastChartSampleAtRef = useRef(0);
+  const lastChartCommandedRef = useRef(0);
 
   const clearError = useCallback(() => {
     if (errorDismissTimerRef.current !== null) {
@@ -171,10 +176,28 @@ export default function FanController() {
     setCommandedSpeed(speed);
   }, []);
 
+  const clearSpeedHistory = useCallback(() => {
+    lastChartSampleAtRef.current = 0;
+    lastChartCommandedRef.current = commandedSpeedRef.current;
+    setSpeedHistory([]);
+  }, []);
+
   const recordSpeedSample = useCallback((actual: number) => {
+    const now = Date.now();
+    const commanded = commandedSpeedRef.current;
+    const commandedChanged = commanded !== lastChartCommandedRef.current;
+    // High-speed firmware can flood notifies; Recharts cannot redraw that fast.
+    if (
+      !commandedChanged
+      && now - lastChartSampleAtRef.current < SPEED_CHART_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    lastChartSampleAtRef.current = now;
+    lastChartCommandedRef.current = commanded;
     const point: SpeedHistoryPoint = {
-      t: Date.now(),
-      commanded: commandedSpeedRef.current,
+      t: now,
+      commanded,
       actual,
     };
     setSpeedHistory((prev) => {
@@ -233,7 +256,7 @@ export default function FanController() {
     setTelemetryLive(false);
     setCurrentMode('stop');
     updateCommandedSpeed(0);
-    setSpeedHistory([]);
+    clearSpeedHistory();
     setMotorState({
       status: 'Stop',
       speed: 0,
@@ -266,7 +289,7 @@ export default function FanController() {
     updateCommandedSpeed(
       initialMode === 'custom' ? simCustomSpeedRef.current : SIM_SPEED_RAD_S[initialMode]
     );
-    setSpeedHistory([]);
+    clearSpeedHistory();
     setTelemetryLive(true);
     pushSimFrame(initialMode);
     simIntervalRef.current = window.setInterval(() => {
@@ -309,7 +332,7 @@ export default function FanController() {
       setTelemetryLive(false);
       setCurrentMode('stop');
       updateCommandedSpeed(0);
-      setSpeedHistory([]);
+      clearSpeedHistory();
       setMotorState({
         status: 'Stop',
         speed: 0,
@@ -496,18 +519,15 @@ export default function FanController() {
         applyTelemetry(telemetry);
       }
 
-      // Log complete frames when available; otherwise show the raw chunk.
+      // Chart + panel only use successfully parsed frames (not raw BLE chunks).
+      // Incomplete SPP fragments stay in the stream buffer — do not log them as
+      // separate lines (they look like "Motor: Running  Spee" / "d: 100.00 …").
       if (telemetryFrames.length > 0) {
         for (const telemetry of telemetryFrames) {
           addDebugMessage(
             'received',
             `Motor: ${telemetry.status}  Speed: ${telemetry.speed.toFixed(2)} Anomaly: ${telemetry.anomaly}`
           );
-        }
-      } else {
-        const dataStr = new TextDecoder().decode(rawData);
-        if (dataStr.trim()) {
-          addDebugMessage('received', dataStr.trim(), rawData);
         }
       }
     }
