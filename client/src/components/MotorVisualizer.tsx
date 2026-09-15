@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef } from 'react';
+import type { AnomalyState } from '@/lib/telemetry-parser';
 
 interface MotorVisualizerProps {
   /** Angular velocity from firmware (rad/s). Sign controls direction. */
@@ -7,30 +8,42 @@ interface MotorVisualizerProps {
   rpm: number;
   /** When false, rotor holds still. */
   active: boolean;
+  /** Firmware anomaly — BLOCKED freezes the rotor even if speed > 0. */
+  anomaly?: AnomalyState;
 }
 
 /** Real ω → on-screen spin (proportional, capped). */
-function toVisualRadPerSec(omega: number): number {
+function toVisualRadPerSec(omega: number, anomaly: AnomalyState): number {
+  if (anomaly === 'BLOCKED') {
+    return 0;
+  }
   const a = Math.abs(omega);
   if (a < 0.05) {
     return 0;
   }
-  const VISUAL_SCALE = 0.27;
-  const VISUAL_MAX = 84;
+  const VISUAL_SCALE = anomaly === 'SLOWED' ? 0.12 : 0.27;
+  const VISUAL_MAX = anomaly === 'SLOWED' ? 28 : 84;
   return Math.sign(omega) * Math.min(a * VISUAL_SCALE, VISUAL_MAX);
 }
 
 /** Top-down motor rotor. Spin rate and direction track live telemetry. */
-export function MotorVisualizer({ speedRadPerSec, rpm, active }: MotorVisualizerProps) {
+export function MotorVisualizer({
+  speedRadPerSec,
+  rpm,
+  active,
+  anomaly = 'NORMAL',
+}: MotorVisualizerProps) {
   const uid = useId().replace(/:/g, '');
   const rotorRef = useRef<SVGGElement>(null);
   const angleRef = useRef(0);
   const speedRef = useRef(speedRadPerSec);
   const activeRef = useRef(active);
+  const anomalyRef = useRef(anomaly);
   const rafRef = useRef<number>(0);
 
   speedRef.current = speedRadPerSec;
   activeRef.current = active;
+  anomalyRef.current = anomaly;
 
   useEffect(() => {
     let lastTs = performance.now();
@@ -39,7 +52,10 @@ export function MotorVisualizer({ speedRadPerSec, rpm, active }: MotorVisualizer
       const dt = Math.min((now - lastTs) / 1000, 0.05);
       lastTs = now;
 
-      const omega = toVisualRadPerSec(activeRef.current ? speedRef.current : 0);
+      const omega = toVisualRadPerSec(
+        activeRef.current ? speedRef.current : 0,
+        anomalyRef.current
+      );
       if (Math.abs(omega) >= 0.05) {
         angleRef.current = (angleRef.current + omega * dt * (180 / Math.PI)) % 360;
         if (angleRef.current < 0) {
@@ -55,8 +71,9 @@ export function MotorVisualizer({ speedRadPerSec, rpm, active }: MotorVisualizer
     return () => cancelAnimationFrame(rafRef.current);
   }, []);
 
+  const blocked = active && anomaly === 'BLOCKED';
   const absRad = Math.abs(speedRadPerSec);
-  const spinning = active && absRad >= 0.05;
+  const spinning = active && !blocked && absRad >= 0.05;
   const absRpm = Math.abs(rpm);
 
   return (
@@ -163,14 +180,20 @@ export function MotorVisualizer({ speedRadPerSec, rpm, active }: MotorVisualizer
       <div className="mt-3 text-center">
         <p
           className={`font-mono font-semibold tracking-tight transition-all duration-200 ${
-            spinning ? 'text-cyan-700 text-base' : 'text-muted-foreground text-sm'
+            blocked
+              ? 'text-destructive text-sm'
+              : spinning
+                ? 'text-cyan-700 text-base'
+                : 'text-muted-foreground text-sm'
           }`}
         >
           {!active
             ? 'Awaiting telemetry'
-            : spinning
-              ? `${absRpm.toFixed(0)} RPM  ·  ${absRad.toFixed(2)} rad/s`
-              : 'Motor stopped'}
+            : blocked
+              ? 'Motor blocked'
+              : spinning
+                ? `${absRpm.toFixed(0)} RPM  ·  ${absRad.toFixed(2)} rad/s`
+                : 'Motor stopped'}
         </p>
       </div>
     </div>

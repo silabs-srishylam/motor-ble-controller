@@ -25,6 +25,8 @@ import {
 const SPEED_HISTORY_MAX = 90;
 /** Cap chart React updates — firmware often notifies faster at high RPM. */
 const SPEED_CHART_MIN_INTERVAL_MS = 100;
+/** Max BLE Debug Console lines retained in memory. */
+const DEBUG_CONSOLE_MAX = 1000;
 
 // Web Bluetooth API type definitions
 declare global {
@@ -217,7 +219,7 @@ export default function FanController() {
       data,
       raw,
     };
-    setDebugMessages((prev) => [...prev.slice(-99), message]); // Keep last 100 messages
+    setDebugMessages((prev) => [...prev.slice(-(DEBUG_CONSOLE_MAX - 1)), message]);
   };
 
   /**
@@ -1053,6 +1055,7 @@ export default function FanController() {
                   speedRadPerSec={telemetryLive ? motorState.speed : 0}
                   rpm={telemetryLive ? motorState.rpm : 0}
                   active={telemetryLive}
+                  anomaly={telemetryLive ? motorState.anomaly : 'NORMAL'}
                 />
                 <div className="mb-8">
                   <div className="flex items-center justify-between mb-3">
