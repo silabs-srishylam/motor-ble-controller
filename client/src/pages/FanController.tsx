@@ -12,14 +12,7 @@ import {
 import { BLE_PROFILES, BLE_SERVICE_UUIDS } from '@/lib/ble-profiles';
 import { writeBleCharacteristic } from '@/lib/ble-write';
 import { TelemetryStreamParser, type MotorTelemetry, anomalyLabel } from '@/lib/telemetry-parser';
-import {
-  buildSimTelemetry,
-  clampSpeedRadS,
-  SIM_SPEED_RAD_S,
-  SPEED_RAD_S_MAX,
-  SPEED_RAD_S_MIN,
-  type SimMotorMode,
-} from '@/lib/telemetry-simulator';
+import { SPEED_RAD_S_MAX, SPEED_RAD_S_MIN } from '@/lib/telemetry-simulator';
 
 /** Max points kept for Speed Compare (SVG redraw cost scales with this). */
 const SPEED_HISTORY_MAX = 90;
@@ -111,8 +104,6 @@ export default function FanController() {
   const [telemetryLive, setTelemetryLive] = useState(false);
   /** Same demo UI + motor visualizer / serial / speed chart. */
   const [testMode, setTestMode] = useState(false);
-  /** In Test Mode: true = fake telemetry, false = live BLE from device. */
-  const [useSimulatedTelemetry, setUseSimulatedTelemetry] = useState(false);
   /** Custom speed field (rad/s), applied via Set / Enter. */
   const [customSpeedInput, setCustomSpeedInput] = useState('100');
   /** Fan Control setpoint for speed compare chart (rad/s). */
@@ -126,9 +117,6 @@ export default function FanController() {
   const errorDismissTimerRef = useRef<number | null>(null);
   /** True while the user (or UI) is intentionally tearing down the link. */
   const intentionalDisconnectRef = useRef(false);
-  const simIntervalRef = useRef<number | null>(null);
-  const simTargetModeRef = useRef<SimMotorMode>('stop');
-  const simCustomSpeedRef = useRef(100);
   const commandedSpeedRef = useRef(0);
   const lastChartSampleAtRef = useRef(0);
   const lastChartCommandedRef = useRef(0);
@@ -250,119 +238,13 @@ export default function FanController() {
     }
   };
 
-  const stopTelemetrySimulation = () => {
-    if (simIntervalRef.current !== null) {
-      window.clearInterval(simIntervalRef.current);
-      simIntervalRef.current = null;
-    }
-    setTelemetryLive(false);
-    setCurrentMode('stop');
-    updateCommandedSpeed(0);
-    clearSpeedHistory();
-    setMotorState({
-      status: 'Stop',
-      speed: 0,
-      rpm: 0,
-      anomaly: 'NORMAL',
-      timestamp: Date.now(),
-    });
-  };
-
-  const pushSimFrame = (mode: SimMotorMode) => {
-    const telemetry = buildSimTelemetry(mode, {
-      speedJitter: mode === 'stop' ? 0 : 1.5,
-      customSpeed: simCustomSpeedRef.current,
-    });
-    applyTelemetry(telemetry);
-    addDebugMessage(
-      'received',
-      `[SIM] Motor: ${telemetry.status}  Speed: ${telemetry.speed.toFixed(2)} Anomaly: ${telemetry.anomaly}`
-    );
-  };
-
-  const startTelemetrySimulation = (initialMode: SimMotorMode = 'low') => {
-    if (simIntervalRef.current !== null) {
-      window.clearInterval(simIntervalRef.current);
-      simIntervalRef.current = null;
-    }
-    clearError();
-    simTargetModeRef.current = initialMode;
-    setCurrentMode(initialMode);
-    updateCommandedSpeed(
-      initialMode === 'custom' ? simCustomSpeedRef.current : SIM_SPEED_RAD_S[initialMode]
-    );
-    clearSpeedHistory();
-    setTelemetryLive(true);
-    pushSimFrame(initialMode);
-    simIntervalRef.current = window.setInterval(() => {
-      pushSimFrame(simTargetModeRef.current);
-    }, 500);
-    addDebugMessage('sent', `[SIM] Started → ${initialMode}`);
-  };
-
-  const setSimMotorMode = (mode: SimMotorMode) => {
-    simTargetModeRef.current = mode;
-    setCurrentMode(mode);
-    updateCommandedSpeed(mode === 'custom' ? simCustomSpeedRef.current : SIM_SPEED_RAD_S[mode]);
-    if (simIntervalRef.current === null) {
-      startTelemetrySimulation(mode);
-      return;
-    }
-    pushSimFrame(mode);
-    addDebugMessage('sent', `[SIM] Mode → ${mode}`);
-  };
-
   const enterTestMode = () => {
     setTestMode(true);
-    setUseSimulatedTelemetry(true);
-    startTelemetrySimulation('low');
   };
 
   const exitTestMode = () => {
-    stopTelemetrySimulation();
-    setUseSimulatedTelemetry(false);
     setTestMode(false);
   };
-
-  /** Test Mode → take telemetry from the real BLE device. */
-  const switchToDeviceTelemetry = () => {
-    stopTelemetrySimulation();
-    setUseSimulatedTelemetry(false);
-    clearError();
-    addDebugMessage('sent', '[TEST] Switched to device telemetry');
-    if (!connected) {
-      setTelemetryLive(false);
-      setCurrentMode('stop');
-      updateCommandedSpeed(0);
-      clearSpeedHistory();
-      setMotorState({
-        status: 'Stop',
-        speed: 0,
-        rpm: 0,
-        anomaly: 'NORMAL',
-        timestamp: Date.now(),
-      });
-    }
-  };
-
-  /** Test Mode → use local simulated Motor: frames. */
-  const switchToSimulatedTelemetry = () => {
-    setUseSimulatedTelemetry(true);
-    clearError();
-    const mode: SimMotorMode = currentMode === 'stop' ? 'low' : currentMode;
-    startTelemetrySimulation(mode);
-    addDebugMessage('sent', '[TEST] Switched to simulated telemetry');
-  };
-
-  const simActive = testMode && useSimulatedTelemetry;
-
-  useEffect(() => {
-    return () => {
-      if (simIntervalRef.current !== null) {
-        window.clearInterval(simIntervalRef.current);
-      }
-    };
-  }, []);
 
   /**
    * Resolve the PM firmware GATT service.
@@ -403,7 +285,6 @@ export default function FanController() {
 
   /**
    * Reset UI / refs after the BLE link is gone.
-   * Keeps test-mode simulation telemetry if active.
    */
   const clearConnectionState = () => {
     deviceRef.current = null;
@@ -411,17 +292,15 @@ export default function FanController() {
     telemetryParserRef.current.reset();
     setConnected(false);
     setConnectionStatus('Disconnected');
-    if (simIntervalRef.current === null) {
-      setCurrentMode('stop');
-      setTelemetryLive(false);
-      setMotorState({
-        status: 'Stop',
-        speed: 0,
-        rpm: 0,
-        anomaly: 'NORMAL',
-        timestamp: Date.now(),
-      });
-    }
+    setCurrentMode('stop');
+    setTelemetryLive(false);
+    setMotorState({
+      status: 'Stop',
+      speed: 0,
+      rpm: 0,
+      anomaly: 'NORMAL',
+      timestamp: Date.now(),
+    });
   };
 
   /**
@@ -443,11 +322,6 @@ export default function FanController() {
   const connectBluetooth = async () => {
     try {
       clearError();
-      // Never mix simulated frames with live BLE notify.
-      if (simIntervalRef.current !== null) {
-        stopTelemetrySimulation();
-        setUseSimulatedTelemetry(false);
-      }
       intentionalDisconnectRef.current = false;
       setConnectionStatus('Scanning...');
 
@@ -506,10 +380,6 @@ export default function FanController() {
     if (intentionalDisconnectRef.current) {
       return;
     }
-    // Ignore BLE notify while simulation is driving the panel.
-    if (simIntervalRef.current !== null) {
-      return;
-    }
     const characteristic = event.target as any;
     const value = characteristic.value as DataView | undefined;
     if (value) {
@@ -562,14 +432,9 @@ export default function FanController() {
   };
 
   /**
-   * Control motor mode — simulated target when Test Mode + Sim, else BLE command.
+   * Control motor mode via BLE command.
    */
   const setMotorMode = async (mode: Exclude<MotorMode, 'custom'>) => {
-    if (simActive) {
-      setSimMotorMode(mode);
-      return;
-    }
-
     let command = '';
     let setpoint = 0;
 
@@ -619,7 +484,7 @@ export default function FanController() {
   };
 
   /**
-   * Apply a user-entered speed (rad/s). Test Mode only. Clamped to [MIN, MAX].
+   * Apply a user-entered speed (rad/s) in Test Mode. Clamped to [MIN, MAX].
    */
   const applyCustomSpeed = async () => {
     if (!testMode) {
@@ -632,7 +497,7 @@ export default function FanController() {
       return;
     }
 
-    const speed = clampSpeedRadS(parsed);
+    const speed = Math.min(SPEED_RAD_S_MAX, Math.max(SPEED_RAD_S_MIN, parsed));
     if (speed !== parsed) {
       setCustomSpeedInput(String(speed));
     }
@@ -640,16 +505,9 @@ export default function FanController() {
     const commandValue = Number.isInteger(speed) ? String(speed) : speed.toFixed(2);
     const command = `M${commandValue}`;
 
-    simCustomSpeedRef.current = speed;
     setCurrentMode(speed === 0 ? 'stop' : 'custom');
     updateCommandedSpeed(speed);
     clearError();
-
-    if (simActive) {
-      setSimMotorMode(speed === 0 ? 'stop' : 'custom');
-      addDebugMessage('sent', `[SIM] ${command}`);
-      return;
-    }
 
     if (!connected) {
       showError('Not connected to device');
@@ -854,7 +712,6 @@ export default function FanController() {
                   {!connected ? (
                     <Button
                       onClick={connectBluetooth}
-                      disabled={simActive}
                       className="w-full tech-button bg-accent hover:bg-accent/90 text-accent-foreground"
                     >
                       <Bluetooth className="w-4 h-4 mr-2" />
@@ -865,41 +722,13 @@ export default function FanController() {
                       Disconnect
                     </Button>
                   )}
-                  <div className="mt-3 space-y-2">
-                    <p className="text-xs text-center font-medium text-amber-800">
-                      {simActive
-                        ? 'Test Mode: using simulated telemetry'
-                        : 'Test Mode: using device telemetry'}
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant={simActive ? 'default' : 'outline'}
-                        onClick={switchToSimulatedTelemetry}
-                        className={
-                          simActive
-                            ? 'bg-amber-500 hover:bg-amber-600 text-white'
-                            : 'border-amber-300 text-amber-800 hover:bg-amber-50'
-                        }
-                      >
-                        Simulated
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant={!simActive ? 'default' : 'outline'}
-                        onClick={switchToDeviceTelemetry}
-                        className={
-                          !simActive
-                            ? 'bg-cyan-600 hover:bg-cyan-700 text-white'
-                            : 'border-cyan-300 text-cyan-800 hover:bg-cyan-50'
-                        }
-                      >
-                        Device
-                      </Button>
-                    </div>
-                  </div>
+                  <p
+                    className={`mt-3 text-xs text-center font-medium ${
+                      connected ? 'text-green-700' : 'text-muted-foreground'
+                    }`}
+                  >
+                    {connected ? 'BLE Connected' : connectionStatus}
+                  </p>
                 </div>
               </div>
 
@@ -908,7 +737,7 @@ export default function FanController() {
                 <div className="space-y-2.5 flex-1">
                   <button
                     onClick={() => setMotorMode('stop')}
-                    disabled={!connected && !simActive}
+                    disabled={!connected}
                     className={`w-full tech-button py-3 rounded-lg text-sm font-semibold transition-all ${
                       currentMode === 'stop'
                         ? 'bg-gray-500 text-white shadow-md'
@@ -919,7 +748,7 @@ export default function FanController() {
                   </button>
                   <button
                     onClick={() => setMotorMode('low')}
-                    disabled={!connected && !simActive}
+                    disabled={!connected}
                     className={`w-full tech-button py-3 rounded-lg text-sm font-semibold transition-all ${
                       currentMode === 'low'
                         ? 'bg-green-500 text-white shadow-md'
@@ -930,7 +759,7 @@ export default function FanController() {
                   </button>
                   <button
                     onClick={() => setMotorMode('high')}
-                    disabled={!connected && !simActive}
+                    disabled={!connected}
                     className={`w-full tech-button py-3 rounded-lg text-sm font-semibold transition-all ${
                       currentMode === 'high'
                         ? 'bg-accent text-accent-foreground shadow-md'
@@ -961,7 +790,7 @@ export default function FanController() {
                         max={SPEED_RAD_S_MAX}
                         step="any"
                         value={customSpeedInput}
-                        disabled={!connected && !simActive}
+                        disabled={!connected}
                         onChange={(e) => setCustomSpeedInput(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') {
@@ -976,7 +805,7 @@ export default function FanController() {
                         type="button"
                         size="sm"
                         onClick={() => void applyCustomSpeed()}
-                        disabled={!connected && !simActive}
+                        disabled={!connected}
                         className="shrink-0 h-8 bg-primary text-primary-foreground hover:bg-primary/90"
                       >
                         Set
@@ -995,7 +824,7 @@ export default function FanController() {
                     </div>
                     <button
                       onClick={toggleAutoShutoff}
-                      disabled={!connected || simActive}
+                      disabled={!connected}
                       className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
                         autoShutoffEnabled ? 'bg-accent' : 'bg-gray-300'
                       } disabled:opacity-50 disabled:cursor-not-allowed`}
@@ -1030,25 +859,18 @@ export default function FanController() {
               <div className="bg-white rounded-xl p-8 shadow-sm border border-border h-full">
                 <h2 className="text-lg font-bold text-primary mb-6 text-center">Real-Time Telemetry</h2>
                 <div className="mb-6 flex items-center justify-center gap-2 text-xs font-medium">
-                  {simActive && telemetryLive ? (
-                    <>
-                      <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-                      <span className="text-amber-700">Test Mode · simulated telemetry</span>
-                    </>
-                  ) : connected && telemetryLive ? (
+                  {connected && telemetryLive ? (
                     <>
                       <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                      <span className="text-green-700">Test Mode · live via BLE notify</span>
+                      <span className="text-green-700">Live via BLE notify</span>
                     </>
                   ) : connected ? (
                     <>
                       <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
                       <span className="text-amber-700">Waiting for device telemetry…</span>
                     </>
-                  ) : !simActive ? (
-                    <span className="text-muted-foreground">Connect device for live telemetry</span>
                   ) : (
-                    <span className="text-muted-foreground">Connect to stream telemetry</span>
+                    <span className="text-muted-foreground">Connect device for live telemetry</span>
                   )}
                 </div>
                 <MotorVisualizer
