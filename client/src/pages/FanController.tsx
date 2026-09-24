@@ -52,7 +52,7 @@ declare global {
   }
 }
 
-type MotorMode = 'stop' | 'low' | 'high' | 'custom';
+type MotorMode = 'stop' | 'default' | 'fast' | 'custom';
 
 /** Firmware accepts motor speed refs in -300..300 rad/s (legacy BLE: M<n>, M0 = stop; negative = reverse). */
 const MOTOR_SPEED_MIN_RAD_S = -300;
@@ -288,10 +288,10 @@ export default function FanController() {
     const absSpeed = Math.abs(telemetry.speed);
     if (telemetry.status === 'Stop' || absSpeed < 1) {
       setCurrentMode('stop');
-    } else if (Math.abs(absSpeed - 50) <= 5) {
-      setCurrentMode('low');
+    } else if (Math.abs(absSpeed - 100) <= 5) {
+      setCurrentMode('default');
     } else if (Math.abs(absSpeed - 250) <= 5) {
-      setCurrentMode('high');
+      setCurrentMode('fast');
     } else {
       setCurrentMode('custom');
     }
@@ -370,10 +370,10 @@ export default function FanController() {
       case 'stop':
         command = 'M0';
         break;
-      case 'low':
-        command = 'M50';
+      case 'default':
+        command = 'M100';
         break;
-      case 'high':
+      case 'fast':
         command = 'M250';
         break;
     }
@@ -481,6 +481,7 @@ export default function FanController() {
               <span className="text-sm font-medium text-foreground">
                 {connected ? 'Connected' : connectionStatus}
               </span>
+              <Bluetooth className={`w-4 h-4 ${connected ? 'text-green-600' : 'text-red-500'}`} />
             </div>
           </div>
         </div>
@@ -580,30 +581,30 @@ export default function FanController() {
                     <span className="text-lg">⏹</span> Stop
                   </button>
 
-                  {/* Low Speed Button */}
+                  {/* Default Speed Button */}
                   <button
-                    onClick={() => setMotorMode('low')}
+                    onClick={() => setMotorMode('default')}
                     disabled={!connected}
                     className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
-                      currentMode === 'low'
+                      currentMode === 'default'
                         ? 'bg-green-500 text-green-foreground shadow-lg'
                         : 'bg-green-100 text-green-700 hover:bg-green-200'
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
-                    <span className="text-lg">🌀</span> Low (50 rad/s)
+                    <span className="text-lg">🌀</span> Default (100 rad/s)
                   </button>
 
-                  {/* High Speed Button */}
+                  {/* Fast Speed Button */}
                   <button
-                    onClick={() => setMotorMode('high')}
+                    onClick={() => setMotorMode('fast')}
                     disabled={!connected}
                     className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
-                      currentMode === 'high'
+                      currentMode === 'fast'
                         ? 'bg-accent text-accent-foreground shadow-lg'
                         : 'bg-accent/10 text-accent hover:bg-accent/20'
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
-                    <span className="text-lg">⚡</span> High (250 rad/s)
+                    <span className="text-lg">⚡</span> Fast (250 rad/s)
                   </button>
 
                   {/* Custom Speed */}
