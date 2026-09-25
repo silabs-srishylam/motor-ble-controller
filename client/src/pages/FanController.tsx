@@ -8,7 +8,7 @@ import { TelemetryStreamParser, type MotorTelemetry, anomalyLabel } from '@/lib/
 import type { TransportKind } from '@/lib/transport/types';
 import { WifiHttpTransport } from '@/lib/wifi-transport';
 import { parseWifiStatusLine, type WifiDeviceStatus } from '@/lib/wifi-status';
-import { loadStoredWifiNetworks, saveWifiNetwork, loadStoredDeviceIps, saveDeviceIp } from '@/lib/wifi-credentials';
+import { loadStoredWifiNetworks, saveWifiNetwork, loadStoredDeviceIps, saveDeviceIp, clearAllStoredWifi } from '@/lib/wifi-credentials';
 
 // Web Bluetooth API type definitions
 declare global {
@@ -674,6 +674,23 @@ export default function FanController() {
     setStoredNetworks(loadStoredWifiNetworks());
     setWifiUseStored(loadStoredWifiNetworks().length > 0);
     setWifiDialogOpen(true);
+
+    /*
+     * If the Si917 reports no NVM credentials, drop stale browser cache so
+     * "Use stored network (…)" does not appear when the device has none.
+     */
+    if (transportRef.current === 'ble' && characteristicRef.current) {
+      void (async () => {
+        try {
+          const status = await queryWifiStatusOverBle(4000);
+          if (status.state === 'down' && !status.stored) {
+            clearHostWifiCache();
+          }
+        } catch {
+          /* Ignore — dialog still usable with manual SSID entry. */
+        }
+      })();
+    }
   };
 
   const switchToWifi = async (opts?: { ssid?: string; password?: string; useStored?: boolean }) => {
@@ -860,14 +877,28 @@ export default function FanController() {
     await sendCommand(`M${speed}`);
   };
 
+  /** Drop browser-cached SSIDs/IPs so the Switch-to-Wi-Fi dialog stays in sync with device NVM. */
+  const clearHostWifiCache = () => {
+    clearAllStoredWifi();
+    setStoredNetworks([]);
+    setStoredDeviceIps([]);
+    setWifiIp('');
+    setWifiSsid('');
+    setWifiPassword('');
+    setWifiUseStored(false);
+  };
+
   /**
-   * Disconnect from Bluetooth device.
-   * Drops the GATT link immediately; gattserverdisconnected clears UI state.
+   * User Disconnect:
+   * - Wi-Fi UI: leave AP + clear device NVM + clear browser Wi-Fi cache, then tear down HTTP.
+   * - BLE UI: drop GATT only — do not touch Si917 Wi-Fi / NVM / host credential cache.
    */
   const disconnectBluetooth = () => {
     const device = deviceRef.current;
     const characteristic = characteristicRef.current;
     const wifi = wifiTransportRef.current;
+    const onWifi = transportRef.current === 'wifi' && wifi != null;
+
     if (!device && !wifi && !connected) {
       clearConnectionState();
       return;
@@ -879,13 +910,36 @@ export default function FanController() {
     // Update UI immediately — do not wait on stopNotifications (can hang on Linux).
     setConnected(false);
     setConnectionStatus('Disconnected');
+    setWifiDialogOpen(false);
 
-    void wifi?.disconnect();
+    if (onWifi) {
+      /* Wi-Fi Disconnect: leave AP, clear NVM, forget browser-cached credentials. */
+      clearHostWifiCache();
+      void (async () => {
+        try {
+          await wifi.disconnect({ leaveAp: true });
+        } finally {
+          wifiTransportRef.current = null;
+          intentionalDisconnectRef.current = true;
+          clearConnectionState();
+          window.setTimeout(() => {
+            intentionalDisconnectRef.current = false;
+          }, 500);
+        }
+      })();
+      return;
+    }
+
+    /* BLE Disconnect: tear down GATT only — Si917 STA / NVM stay as-is. */
+    void wifi?.disconnect(); /* stop poll only if a stale wifi ref exists */
     wifiTransportRef.current = null;
 
     if (characteristic) {
       try {
-        characteristic.removeEventListener('characteristicvaluechanged', characteristicChangeListener);
+        characteristic.removeEventListener(
+          'characteristicvaluechanged',
+          characteristicChangeListener
+        );
       } catch {
         // Ignore.
       }
@@ -895,19 +949,14 @@ export default function FanController() {
       if (device) {
         device.removeEventListener('gattserverdisconnected', gattDisconnectedListener);
       }
-      // Drop the BLE link right away. skip awaiting CCCD clear — disconnect tears it down.
       if (device?.gatt?.connected) {
         device.gatt.disconnect();
       }
     } catch (err) {
       console.error('Disconnect error:', err);
     } finally {
-      // Always clear locally; intentional flag suppresses the "connection lost" error
-      // if gattserverdisconnected also fires.
       intentionalDisconnectRef.current = true;
       clearConnectionState();
-      // Keep flag true briefly so a late gattserverdisconnected does not show an error,
-      // then clear it on the next tick.
       window.setTimeout(() => {
         intentionalDisconnectRef.current = false;
       }, 500);

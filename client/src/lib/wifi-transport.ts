@@ -168,11 +168,30 @@ export class WifiHttpTransport implements DeviceTransport {
     this.start(this.onData, this.onDisconnect ?? undefined, pollMs);
   }
 
-  async disconnect(): Promise<void> {
+  /**
+   * Stop HTTP polling. When `leaveAp` is true, also ask the Si917 to leave the
+   * AP and clear NVM credentials (`wifi disconnect`) before the link dies.
+   *
+   * Use leaveAp only for user Disconnect — not for Wi-Fi→BLE handoff (STA stays up).
+   */
+  async disconnect(options?: { leaveAp?: boolean }): Promise<void> {
+    /* Stop /telemetry first — firmware HTTP is single-client. */
     this.stopped = true;
     if (this.pollTimer !== null) {
       window.clearTimeout(this.pollTimer);
       this.pollTimer = null;
+    }
+
+    if (options?.leaveAp) {
+      try {
+        /*
+         * Firmware queues leave + NVM clear and replies WIFI: DISCONNECTING.
+         * The socket may die mid-response once the STA drops — ignore that.
+         */
+        await this.send('wifi disconnect');
+      } catch {
+        /* Expected if the AP drop closes the HTTP connection mid-flight. */
+      }
     }
   }
 }

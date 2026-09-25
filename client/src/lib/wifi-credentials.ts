@@ -25,6 +25,11 @@ export function saveWifiNetwork(network: StoredWifiNetwork): void {
   localStorage.setItem(NETWORKS_KEY, JSON.stringify(list.slice(0, 8)));
 }
 
+/** Clear browser-cached SSIDs/passwords (keeps UI in sync after device NVM erase). */
+export function clearStoredWifiNetworks(): void {
+  localStorage.removeItem(NETWORKS_KEY);
+}
+
 /** Recently used device LAN IPs (most recent first). */
 export function loadStoredDeviceIps(): string[] {
   try {
@@ -44,4 +49,18 @@ export function saveDeviceIp(ip: string): void {
   const list = loadStoredDeviceIps().filter((x) => x !== trimmed);
   list.unshift(trimmed);
   localStorage.setItem(DEVICE_IPS_KEY, JSON.stringify(list.slice(0, 8)));
+}
+
+/** Clear cached device LAN IPs. */
+export function clearStoredDeviceIps(): void {
+  localStorage.removeItem(DEVICE_IPS_KEY);
+}
+
+/**
+ * Forget all host-side Wi-Fi provisioning cache (networks + device IPs).
+ * Call when the Si917 NVM credentials are cleared (user Disconnect).
+ */
+export function clearAllStoredWifi(): void {
+  clearStoredWifiNetworks();
+  clearStoredDeviceIps();
 }
