@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Start the Vite dev server without requiring pnpm on PATH.
+# Vite 7 needs Node.js 20.19+ / 22.12+ (optional chaining, etc.).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

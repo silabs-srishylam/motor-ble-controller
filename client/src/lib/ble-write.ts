@@ -11,6 +11,15 @@ export interface BleCharacteristicLike {
 
 export type BleWriteMode = 'withResponse' | 'withoutResponse';
 
+/** Match Si917 SPP notify/write chunk size (default ATT MTU 23 → 20 byte payload). */
+export const BLE_SPP_CHUNK_LEN = 20;
+
+function toUint8Array(data: BufferSource): Uint8Array {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+}
+
 /**
  * Write to a BLE characteristic using the mode the device supports.
  * SPP/UART characteristics often only accept write-without-response;
@@ -47,6 +56,35 @@ export async function writeBleCharacteristic(
 
   await characteristic.writeValue(data);
   return 'withResponse';
+}
+
+/**
+ * Write a full SPP payload in ≤20-byte chunks. Firmware reassembles until '\\n',
+ * so long commands like `wifi connect <ssid> <psk>` must be split or the GATT
+ * write is rejected / truncated at the default ATT MTU.
+ */
+export async function writeBleCharacteristicChunked(
+  characteristic: BleCharacteristicLike,
+  data: BufferSource,
+  chunkLen = BLE_SPP_CHUNK_LEN
+): Promise<BleWriteMode> {
+  const bytes = toUint8Array(data);
+  if (bytes.length === 0) {
+    return 'withoutResponse';
+  }
+  if (bytes.length <= chunkLen) {
+    return writeBleCharacteristic(characteristic, bytes);
+  }
+
+  let mode: BleWriteMode = 'withoutResponse';
+  for (let offset = 0; offset < bytes.length; offset += chunkLen) {
+    const end = Math.min(offset + chunkLen, bytes.length);
+    mode = await writeBleCharacteristic(characteristic, bytes.slice(offset, end));
+    if (end < bytes.length) {
+      await new Promise((r) => window.setTimeout(r, 15));
+    }
+  }
+  return mode;
 }
 
 export function describeCharacteristicProperties(
