@@ -77,6 +77,10 @@ const ERROR_DISMISS_MS = 5000;
 export default function FanController() {
   const [connected, setConnected] = useState(false);
   const [transport, setTransport] = useState<TransportKind>('ble');
+  /** null = not probed yet; false = old FW or Wi-Fi compiled out */
+  const [wifiSupported, setWifiSupported] = useState<boolean | null>(null);
+  /** Device Wi-Fi STA still associated (may remain up while UI uses BLE). */
+  const [deviceWifiUp, setDeviceWifiUp] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [wifiDialogOpen, setWifiDialogOpen] = useState(false);
   /** direct = connect to device already on LAN; provision = BLE-mediated join */
@@ -230,6 +234,8 @@ export default function FanController() {
     bleRxLineBufRef.current = '';
     setConnected(false);
     setTransport('ble');
+    setWifiSupported(null);
+    setDeviceWifiUp(false);
     setConnectionStatus('Disconnected');
     setCurrentMode('stop');
     setTelemetryLive(false);
@@ -342,6 +348,38 @@ export default function FanController() {
         anomaly: 'NORMAL',
         timestamp: Date.now(),
       });
+      if (fromWifi) {
+        setWifiSupported(true);
+      } else {
+        /*
+         * Defer capability probe until after CCCD settle. Immediate wifi status
+         * ATT traffic right after connect correlates with coex disconnects.
+         * Unknown command => Wi-Fi compiled out / old FW.
+         */
+        void (async () => {
+          await new Promise((r) => window.setTimeout(r, 2000));
+          if (!deviceRef.current?.gatt?.connected || transportRef.current !== 'ble') {
+            return;
+          }
+          try {
+            await queryWifiStatusOverBle(4000);
+            if (deviceRef.current?.gatt?.connected && transportRef.current === 'ble') {
+              setWifiSupported(true);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : '';
+            if (
+              msg === 'WIFI_UNSUPPORTED' ||
+              /unknown command|does not support Wi-Fi/i.test(msg)
+            ) {
+              if (deviceRef.current?.gatt?.connected && transportRef.current === 'ble') {
+                setWifiSupported(false);
+              }
+            }
+            /* Timeout / link drop — leave wifiSupported as-is. */
+          }
+        })();
+      }
       return true;
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : 'Connection failed';
@@ -427,11 +465,7 @@ export default function FanController() {
         const waiter = wifiStatusWaiterRef.current;
         wifiStatusWaiterRef.current = null;
         window.clearTimeout(waiter.timer);
-        waiter.reject(
-          new Error(
-            'Device firmware does not support Wi-Fi BLE commands. Rebuild and flash the latest predictive_maintenance image, then retry.'
-          )
-        );
+        waiter.reject(new Error('WIFI_UNSUPPORTED'));
       }
     }
 
@@ -628,6 +662,8 @@ export default function FanController() {
     setStoredDeviceIps(loadStoredDeviceIps());
     setWifiIp(ip);
     setTransport('wifi');
+    setDeviceWifiUp(true);
+    setWifiSupported(true);
     setConnected(true);
     setConnectionStatus(`Connected via Wi-Fi (${ip})`);
   };
@@ -771,7 +807,11 @@ export default function FanController() {
       setWifiDialogOpen(false);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Wi-Fi switch failed';
-      showError(msg, 8000);
+      if (msg === 'WIFI_UNSUPPORTED' || /unknown command|does not support Wi-Fi/i.test(msg)) {
+        setWifiSupported(false);
+      } else {
+        showError(msg, 8000);
+      }
       setConnectionStatus('Connected via BLE');
       setTransport('ble');
       transportRef.current = 'ble';
@@ -806,6 +846,7 @@ export default function FanController() {
       await wifi?.disconnect();
       transportRef.current = 'ble';
       setTransport('ble');
+      setDeviceWifiUp(true);
       setConnectionStatus('Connected via BLE (Wi-Fi still up on device)');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'BLE switch failed';
@@ -819,6 +860,7 @@ export default function FanController() {
       }
       transportRef.current = 'wifi';
       setTransport('wifi');
+      setDeviceWifiUp(true);
       setConnected(true);
       setConnectionStatus(
         wifiTransportRef.current
@@ -964,6 +1006,12 @@ export default function FanController() {
   };
 
   const bluetoothSupported = 'bluetooth' in navigator;
+  const wifiUiEnabled = wifiSupported !== false;
+  const bleLinkActive = connected && transport === 'ble';
+  const wifiLinkActive = wifiUiEnabled && connected && (transport === 'wifi' || deviceWifiUp);
+  const bleIconClass = bleLinkActive ? 'text-green-600' : 'text-muted-foreground/40';
+  const wifiIconClass = wifiLinkActive ? 'text-green-600' : 'text-muted-foreground/40';
+  const telemetrySource = transport === 'wifi' ? 'Wi-Fi' : 'BLE';
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-background via-secondary to-background">
@@ -986,9 +1034,10 @@ export default function FanController() {
             <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${connected ? 'bg-green-50' : 'bg-red-50'}`}>
               <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
               <span className="text-sm font-medium text-foreground">
-                {connected ? 'Connected' : connectionStatus}
+                {connectionStatus}
               </span>
-              <Bluetooth className={`w-4 h-4 ${connected ? 'text-green-600' : 'text-red-500'}`} />
+              <Bluetooth className={`w-4 h-4 ${bleIconClass}`} />
+              {wifiUiEnabled && <Wifi className={`w-4 h-4 ${wifiIconClass}`} />}
             </div>
           </div>
         </div>
@@ -996,10 +1045,21 @@ export default function FanController() {
 
       {/* Main Content */}
       <main className="container py-12">
-        {!bluetoothSupported && !connected && (
+        {!bluetoothSupported && !connected && wifiUiEnabled && (
           <div className="max-w-2xl mx-auto mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-900">
             Web Bluetooth is not available in this browser — you can still connect over{' '}
             <strong>Wi-Fi</strong> if the device is already on the same LAN.
+          </div>
+        )}
+        {connected && wifiSupported === false && (
+          <div className="max-w-4xl mx-auto mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-950">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 text-amber-700 flex-shrink-0 mt-0.5" />
+              <p>
+                Wi-Fi is disabled on this device (or this firmware was built without Wi-Fi). BLE motor
+                control still works.
+              </p>
+            </div>
           </div>
         )}
 
@@ -1016,13 +1076,27 @@ export default function FanController() {
                       <p className="text-xs text-muted-foreground">Web Bluetooth SPP</p>
                     </div>
                   </div>
-                  <div className="flex items-start gap-3">
-                    <Wifi className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-medium text-foreground">Wi-Fi Connectivity</p>
-                      <p className="text-xs text-muted-foreground">Same-LAN HTTP dataplane</p>
+                  {wifiSupported === false ? (
+                    <div className="flex items-start gap-3 opacity-70">
+                      <Wifi className="w-5 h-5 text-muted-foreground flex-shrink-0 mt-0.5" />
+                      <div>
+                        <p className="font-medium text-foreground">Wi-Fi Connectivity</p>
+                        <p className="text-xs text-muted-foreground">
+                          Not available on this firmware
+                        </p>
+                      </div>
                     </div>
-                  </div>
+                  ) : (
+                    wifiUiEnabled && (
+                      <div className="flex items-start gap-3">
+                        <Wifi className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
+                        <div>
+                          <p className="font-medium text-foreground">Wi-Fi Connectivity</p>
+                          <p className="text-xs text-muted-foreground">Same-LAN HTTP dataplane</p>
+                        </div>
+                      </div>
+                    )
+                  )}
                   <div className="flex items-start gap-3">
                     <Zap className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
                     <div>
@@ -1051,18 +1125,22 @@ export default function FanController() {
                         <Bluetooth className="w-4 h-4 mr-2" />
                         Connect over BLE
                       </Button>
-                      <Button
-                        onClick={openWifiDirectDialog}
-                        disabled={switching}
-                        variant="outline"
-                        className="w-full tech-button"
-                      >
-                        <Wifi className="w-4 h-4 mr-2" />
-                        Connect over Wi-Fi
-                      </Button>
-                      <p className="text-xs text-muted-foreground">
-                        Use Wi-Fi if the device is already joined to your LAN (enter its IP).
-                      </p>
+                      {wifiUiEnabled && (
+                        <>
+                          <Button
+                            onClick={openWifiDirectDialog}
+                            disabled={switching}
+                            variant="outline"
+                            className="w-full tech-button"
+                          >
+                            <Wifi className="w-4 h-4 mr-2" />
+                            Connect over Wi-Fi
+                          </Button>
+                          <p className="text-xs text-muted-foreground">
+                            Use Wi-Fi if the device is already joined to your LAN (enter its IP).
+                          </p>
+                        </>
+                      )}
                     </>
                   ) : (
                     <>
@@ -1078,25 +1156,27 @@ export default function FanController() {
                           <Bluetooth className="w-3.5 h-3.5 inline mr-1" />
                           BLE
                         </button>
-                        <button
-                          type="button"
-                          disabled={switching || transport === 'wifi'}
-                          onClick={() => {
-                            if (transport === 'ble') {
-                              openWifiProvisionDialog();
-                            } else {
-                              openWifiDirectDialog();
-                            }
-                          }}
-                          className={`flex-1 px-3 py-2 text-sm font-medium border-l border-border ${
-                            transport === 'wifi' ? 'bg-primary text-primary-foreground' : 'bg-white text-foreground hover:bg-secondary'
-                          } disabled:opacity-60`}
-                        >
-                          <Wifi className="w-3.5 h-3.5 inline mr-1" />
-                          Wi-Fi
-                        </button>
+                        {wifiUiEnabled && (
+                          <button
+                            type="button"
+                            disabled={switching || transport === 'wifi'}
+                            onClick={() => {
+                              if (transport === 'ble') {
+                                openWifiProvisionDialog();
+                              } else {
+                                openWifiDirectDialog();
+                              }
+                            }}
+                            className={`flex-1 px-3 py-2 text-sm font-medium border-l border-border ${
+                              transport === 'wifi' ? 'bg-primary text-primary-foreground' : 'bg-white text-foreground hover:bg-secondary'
+                            } disabled:opacity-60`}
+                          >
+                            <Wifi className="w-3.5 h-3.5 inline mr-1" />
+                            Wi-Fi
+                          </button>
+                        )}
                       </div>
-                      {transport === 'ble' && (
+                      {wifiUiEnabled && transport === 'ble' && (
                         <Button
                           variant="outline"
                           className="w-full"
@@ -1244,14 +1324,14 @@ export default function FanController() {
                   {connected && telemetryLive ? (
                     <>
                       <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                      <span className="text-green-700">
-                        Live via {transport === 'wifi' ? 'Wi-Fi' : 'BLE notify'}
-                      </span>
+                      <span className="text-green-700">Live via {telemetrySource}</span>
                     </>
                   ) : connected ? (
                     <>
                       <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                      <span className="text-amber-700">Waiting for device telemetry…</span>
+                      <span className="text-amber-700">
+                        Waiting for {telemetrySource} telemetry…
+                      </span>
                     </>
                   ) : (
                     <span className="text-muted-foreground">Connect to stream telemetry</span>
@@ -1501,7 +1581,7 @@ export default function FanController() {
       {/* Footer */}
       <footer className="border-t border-border bg-white/50 backdrop-blur-sm mt-12">
         <div className="container py-6 text-center text-sm text-muted-foreground">
-          <p>© 2025 Silicon Labs. Web Bluetooth Fan Controller Demo v1.0.0</p>
+          <p>© 2025 Silicon Labs. Web Bluetooth Fan Controller Demo v1.1.0</p>
         </div>
       </footer>
     </div>
