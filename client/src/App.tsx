@@ -9,12 +9,15 @@ import FanController from "./pages/FanController";
 
 
 function Router() {
+  // file:// has a filesystem path, so /motor-ble-controller/ never matches;
+  // keep hosted routing unchanged and only fall back to the app for local files.
+  const Fallback = location.protocol === "file:" ? FanController : NotFound;
   return (
     <Switch>
       <Route path={"/motor-ble-controller/"} component={FanController} />
       <Route path={"/404"} component={NotFound} />
       {/* Final fallback route */}
-      <Route component={NotFound} />
+      <Route component={Fallback} />
     </Switch>
   );
 }
