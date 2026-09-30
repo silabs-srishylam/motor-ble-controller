@@ -1,7 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Bluetooth, AlertCircle, CheckCircle2, Zap, Power, Wifi } from 'lucide-react';
+import { Bluetooth, AlertCircle, CheckCircle2, Zap, Power, Wifi, FlaskConical } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { DebugConsole, type DebugMessage } from '@/components/DebugConsole';
+import { MotorVisualizer } from '@/components/MotorVisualizer';
+import { SerialTerminal } from '@/components/SerialTerminal';
+import {
+  SpeedCompareChart,
+  type SpeedHistoryPoint,
+} from '@/components/SpeedCompareChart';
 import { BLE_PROFILES, BLE_SERVICE_UUIDS } from '@/lib/ble-profiles';
 import { writeBleCharacteristicChunked } from '@/lib/ble-write';
 import { TelemetryStreamParser, type MotorTelemetry, anomalyLabel } from '@/lib/telemetry-parser';
@@ -9,6 +15,13 @@ import type { TransportKind } from '@/lib/transport/types';
 import { WifiHttpTransport } from '@/lib/wifi-transport';
 import { parseWifiStatusLine, type WifiDeviceStatus } from '@/lib/wifi-status';
 import { loadStoredWifiNetworks, saveWifiNetwork, loadStoredDeviceIps, saveDeviceIp, clearAllStoredWifi } from '@/lib/wifi-credentials';
+
+/** Max points kept for Speed Compare (SVG redraw cost scales with this). */
+const SPEED_HISTORY_MAX = 90;
+/** Cap chart React updates — firmware often notifies faster at high RPM. */
+const SPEED_CHART_MIN_INTERVAL_MS = 100;
+/** Max BLE Debug Console lines retained in memory. */
+const DEBUG_CONSOLE_MAX = 1000;
 
 // Web Bluetooth API type definitions
 declare global {
@@ -105,6 +118,14 @@ export default function FanController() {
   const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
   /** True after at least one full telemetry frame arrived over BLE notifications. */
   const [telemetryLive, setTelemetryLive] = useState(false);
+  /**
+   * Test Mode: demo layout (serial + speed chart + visualizer).
+   * Develop (default): production 3-column layout with Wi-Fi.
+   */
+  const [testMode, setTestMode] = useState(false);
+  /** Fan Control setpoint for speed compare chart (rad/s). */
+  const [commandedSpeed, setCommandedSpeed] = useState(0);
+  const [speedHistory, setSpeedHistory] = useState<SpeedHistoryPoint[]>([]);
 
   const characteristicRef = useRef<any>(null);
   const deviceRef = useRef<BluetoothDevice | null>(null);
@@ -115,6 +136,9 @@ export default function FanController() {
   const errorDismissTimerRef = useRef<number | null>(null);
   /** True while the user (or UI) is intentionally tearing down the link. */
   const intentionalDisconnectRef = useRef(false);
+  const commandedSpeedRef = useRef(0);
+  const lastChartSampleAtRef = useRef(0);
+  const lastChartCommandedRef = useRef(0);
   const wifiStatusWaiterRef = useRef<{
     resolve: (line: string) => void;
     reject: (err: Error) => void;
@@ -163,6 +187,49 @@ export default function FanController() {
     onCharacteristicChangeRef.current(event);
   }).current;
 
+  const updateCommandedSpeed = useCallback((speed: number) => {
+    commandedSpeedRef.current = speed;
+    setCommandedSpeed(speed);
+  }, []);
+
+  const clearSpeedHistory = useCallback(() => {
+    lastChartSampleAtRef.current = 0;
+    lastChartCommandedRef.current = commandedSpeedRef.current;
+    setSpeedHistory([]);
+  }, []);
+
+  const recordSpeedSample = useCallback((actual: number) => {
+    const now = Date.now();
+    const commanded = commandedSpeedRef.current;
+    const commandedChanged = commanded !== lastChartCommandedRef.current;
+    // High-speed firmware can flood notifies; Recharts cannot redraw that fast.
+    if (
+      !commandedChanged
+      && now - lastChartSampleAtRef.current < SPEED_CHART_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+    lastChartSampleAtRef.current = now;
+    lastChartCommandedRef.current = commanded;
+    const point: SpeedHistoryPoint = {
+      t: now,
+      commanded,
+      actual,
+    };
+    setSpeedHistory((prev) => {
+      const next = [...prev, point];
+      return next.length > SPEED_HISTORY_MAX ? next.slice(-SPEED_HISTORY_MAX) : next;
+    });
+  }, []);
+
+  const enterTestMode = () => {
+    setTestMode(true);
+  };
+
+  const exitTestMode = () => {
+    setTestMode(false);
+  };
+
   /**
    * Add a message to the debug console
    */
@@ -174,7 +241,7 @@ export default function FanController() {
       data,
       raw,
     };
-    setDebugMessages((prev) => [...prev.slice(-99), message]); // Keep last 100 messages
+    setDebugMessages((prev) => [...prev.slice(-(DEBUG_CONSOLE_MAX - 1)), message]);
   };
 
   /**
@@ -239,6 +306,8 @@ export default function FanController() {
     setConnectionStatus('Disconnected');
     setCurrentMode('stop');
     setTelemetryLive(false);
+    updateCommandedSpeed(0);
+    clearSpeedHistory();
     setMotorState({
       status: 'Stop',
       speed: 0,
@@ -423,6 +492,7 @@ export default function FanController() {
   const applyTelemetry = (telemetry: MotorTelemetry) => {
     setTelemetryLive(true);
     setMotorState(telemetry);
+    recordSpeedSample(telemetry.speed);
 
     const absSpeed = Math.abs(telemetry.speed);
     if (telemetry.status === 'Stop' || absSpeed < 1) {
@@ -878,21 +948,26 @@ export default function FanController() {
    */
   const setMotorMode = async (mode: Exclude<MotorMode, 'custom'>) => {
     let command = '';
+    let setpoint = 0;
 
     switch (mode) {
       case 'stop':
         command = 'M0';
+        setpoint = 0;
         break;
       case 'default':
         command = 'M100';
+        setpoint = 100;
         break;
       case 'fast':
         command = 'M250';
+        setpoint = 250;
         break;
     }
 
     // Highlight the pressed control; telemetry panel follows device notify stream.
     setCurrentMode(mode);
+    updateCommandedSpeed(setpoint);
     clearError();
     await sendCommand(command);
   };
@@ -916,6 +991,7 @@ export default function FanController() {
 
     clearError();
     setCurrentMode(speed === 0 ? 'stop' : 'custom');
+    updateCommandedSpeed(speed);
     await sendCommand(`M${speed}`);
   };
 
@@ -1026,11 +1102,27 @@ export default function FanController() {
               <h1 className="text-xl font-bold text-primary">
                 Motor BLE Controller
               </h1>
-              <p className="text-xs text-muted-foreground">Motor Control Demo</p>
+              <p className="text-xs text-muted-foreground">
+                {testMode ? 'Test Mode · demo panels' : 'Develop · production UI'}
+              </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant={testMode ? 'default' : 'outline'}
+              size="sm"
+              onClick={() => (testMode ? exitTestMode() : enterTestMode())}
+              className={
+                testMode
+                  ? 'bg-amber-500 hover:bg-amber-600 text-white border-amber-500'
+                  : 'border-amber-300 text-amber-800 hover:bg-amber-50'
+              }
+            >
+              <FlaskConical className="w-4 h-4 mr-1.5" />
+              {testMode ? 'Exit Test Mode' : 'Test Mode'}
+            </Button>
             <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${connected ? 'bg-green-50' : 'bg-red-50'}`}>
               <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
               <span className="text-sm font-medium text-foreground">
@@ -1044,7 +1136,7 @@ export default function FanController() {
       </header>
 
       {/* Main Content */}
-      <main className="container py-12">
+      <main className="container py-8 lg:py-10">
         {!bluetoothSupported && !connected && wifiUiEnabled && (
           <div className="max-w-2xl mx-auto mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-900">
             Web Bluetooth is not available in this browser — you can still connect over{' '}
@@ -1063,374 +1155,748 @@ export default function FanController() {
           </div>
         )}
 
-        <div className="grid lg:grid-cols-3 gap-8">
-            {/* Left: Technology Stack */}
-            <div className="lg:col-span-1">
-              <div className="bg-white rounded-xl p-6 shadow-sm border border-border">
-                <h2 className="text-lg font-bold text-primary mb-4">Technology Stack</h2>
-                <div className="space-y-3">
-                  <div className="flex items-start gap-3">
-                    <Bluetooth className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-medium text-foreground">Bluetooth Connectivity</p>
-                      <p className="text-xs text-muted-foreground">Web Bluetooth SPP</p>
-                    </div>
-                  </div>
-                  {wifiSupported === false ? (
-                    <div className="flex items-start gap-3 opacity-70">
-                      <Wifi className="w-5 h-5 text-muted-foreground flex-shrink-0 mt-0.5" />
-                      <div>
-                        <p className="font-medium text-foreground">Wi-Fi Connectivity</p>
-                        <p className="text-xs text-muted-foreground">
-                          Not available on this firmware
-                        </p>
-                      </div>
-                    </div>
-                  ) : (
-                    wifiUiEnabled && (
-                      <div className="flex items-start gap-3">
-                        <Wifi className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
-                        <div>
-                          <p className="font-medium text-foreground">Wi-Fi Connectivity</p>
-                          <p className="text-xs text-muted-foreground">Same-LAN HTTP dataplane</p>
-                        </div>
-                      </div>
-                    )
-                  )}
-                  <div className="flex items-start gap-3">
-                    <Zap className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-medium text-foreground">Motor Control</p>
-                      <p className="text-xs text-muted-foreground">PWM Speed Regulation</p>
-                    </div>
-                  </div>
-                  <div className="flex items-start gap-3">
-                    <CheckCircle2 className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-medium text-foreground">Anomaly Detection Active Sign</p>
-                      <p className="text-xs text-muted-foreground">AI/ML Edge Processing</p>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Connection — BLE and Wi-Fi both available from the start */}
-                <div className="mt-6 pt-6 border-t border-border space-y-3">
-                  {!connected ? (
-                    <>
-                      <Button
-                        onClick={connectBluetooth}
-                        disabled={!bluetoothSupported || switching}
-                        className="w-full tech-button bg-accent hover:bg-accent/90 text-accent-foreground"
-                      >
-                        <Bluetooth className="w-4 h-4 mr-2" />
-                        Connect over BLE
-                      </Button>
-                      {wifiUiEnabled && (
-                        <>
-                          <Button
-                            onClick={openWifiDirectDialog}
-                            disabled={switching}
-                            variant="outline"
-                            className="w-full tech-button"
-                          >
-                            <Wifi className="w-4 h-4 mr-2" />
-                            Connect over Wi-Fi
-                          </Button>
-                          <p className="text-xs text-muted-foreground">
-                            Use Wi-Fi if the device is already joined to your LAN (enter its IP).
-                          </p>
-                        </>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      <div className="flex rounded-lg border border-border overflow-hidden">
-                        <button
-                          type="button"
-                          disabled={switching || transport === 'ble'}
-                          onClick={() => void switchToBle()}
-                          className={`flex-1 px-3 py-2 text-sm font-medium ${
-                            transport === 'ble' ? 'bg-primary text-primary-foreground' : 'bg-white text-foreground hover:bg-secondary'
-                          } disabled:opacity-60`}
-                        >
-                          <Bluetooth className="w-3.5 h-3.5 inline mr-1" />
-                          BLE
-                        </button>
-                        {wifiUiEnabled && (
-                          <button
-                            type="button"
-                            disabled={switching || transport === 'wifi'}
-                            onClick={() => {
-                              if (transport === 'ble') {
-                                openWifiProvisionDialog();
-                              } else {
-                                openWifiDirectDialog();
-                              }
-                            }}
-                            className={`flex-1 px-3 py-2 text-sm font-medium border-l border-border ${
-                              transport === 'wifi' ? 'bg-primary text-primary-foreground' : 'bg-white text-foreground hover:bg-secondary'
-                            } disabled:opacity-60`}
-                          >
-                            <Wifi className="w-3.5 h-3.5 inline mr-1" />
-                            Wi-Fi
-                          </button>
-                        )}
-                      </div>
-                      {wifiUiEnabled && transport === 'ble' && (
-                        <Button
-                          variant="outline"
-                          className="w-full"
-                          disabled={switching}
-                          onClick={openWifiProvisionDialog}
-                        >
-                          Configure / switch to Wi-Fi…
-                        </Button>
-                      )}
-                      <Button
-                        onClick={disconnectBluetooth}
-                        variant="outline"
-                        className="w-full tech-button"
-                        disabled={switching}
-                      >
-                        Disconnect
-                      </Button>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Center: Control Panel */}
-            <div className="lg:col-span-1">
-              <div className="bg-white rounded-xl p-8 shadow-sm border border-border">
-                <h2 className="text-lg font-bold text-primary mb-8 text-center">Fan Control</h2>
-
-                <div className="space-y-4">
-                  {/* Stop Button */}
-                  <button
-                    onClick={() => setMotorMode('stop')}
-                    disabled={!connected}
-                    className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
-                      currentMode === 'stop'
-                        ? 'bg-gray-500 text-white shadow-lg'
-                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    <span className="text-lg">⏹</span> Stop
-                  </button>
-
-                  {/* Default Speed Button */}
-                  <button
-                    onClick={() => setMotorMode('default')}
-                    disabled={!connected}
-                    className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
-                      currentMode === 'default'
-                        ? 'bg-green-500 text-green-foreground shadow-lg'
-                        : 'bg-green-100 text-green-700 hover:bg-green-200'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    <span className="text-lg">🌀</span> Default (100 rad/s)
-                  </button>
-
-                  {/* Fast Speed Button */}
-                  <button
-                    onClick={() => setMotorMode('fast')}
-                    disabled={!connected}
-                    className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
-                      currentMode === 'fast'
-                        ? 'bg-accent text-accent-foreground shadow-lg'
-                        : 'bg-accent/10 text-accent hover:bg-accent/20'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    <span className="text-lg">⚡</span> Fast (250 rad/s)
-                  </button>
-
-                  {/* Custom Speed */}
-                  <div
-                    className={`rounded-xl border p-4 transition-all ${
-                      currentMode === 'custom'
-                        ? 'border-primary bg-primary/5 shadow-sm'
-                        : 'border-border bg-secondary/30'
-                    }`}
-                  >
-                    <label
-                      htmlFor="custom-speed"
-                      className="mb-2 block text-sm font-medium text-foreground"
-                    >
-                      Custom speed (rad/s)
-                    </label>
-                    <div className="flex gap-2">
-                      <input
-                        id="custom-speed"
-                        type="number"
-                        min={MOTOR_SPEED_MIN_RAD_S}
-                        max={MOTOR_SPEED_MAX_RAD_S}
-                        step={1}
-                        value={customSpeedInput}
-                        onChange={(e) => setCustomSpeedInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            void setCustomSpeed();
-                          }
-                        }}
-                        disabled={!connected}
-                        className="w-full rounded-lg border border-border bg-white px-3 py-2 font-mono text-sm text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
-                        placeholder="e.g. 100 or -100"
-                      />
-                      <Button
-                        onClick={() => void setCustomSpeed()}
-                        disabled={!connected}
-                        className="shrink-0 tech-button bg-primary hover:bg-primary/90 text-primary-foreground"
-                      >
-                        Set
-                      </Button>
-                    </div>
-                    <p className="mt-2 text-xs text-muted-foreground">
-                      Range {MOTOR_SPEED_MIN_RAD_S}–{MOTOR_SPEED_MAX_RAD_S} rad/s (negative = reverse, M0 = stop)
+        {testMode ? (
+        /* ——— Test Mode: 2×2 demo panels + telemetry ——— */
+        <div className="grid lg:grid-cols-3 gap-4 lg:gap-6 items-stretch min-h-[calc(100vh-10rem)]">
+          {/* Left 2×2: Tech | Fan / Serial | Speed Compare — equal panels like original demo */}
+          <div className="lg:col-span-2 grid min-h-0 gap-4 lg:grid-cols-2 lg:grid-rows-[minmax(280px,auto)_minmax(280px,1fr)]">
+            {/* Technology Stack — keep connect actions shrink-0 so Wi-Fi is never clipped under Serial */}
+            <div className="bg-white rounded-xl p-6 shadow-sm border border-border flex flex-col w-full h-full min-h-0 overflow-hidden">
+              <h2 className="text-lg font-bold text-primary mb-4 shrink-0">Technology Stack</h2>
+              <div className={`min-h-0 flex-1 overflow-y-auto ${wifiUiEnabled ? 'space-y-2' : 'space-y-3'}`}>
+                <div className="flex items-start gap-3">
+                  <Bluetooth className={`${wifiUiEnabled ? 'w-4 h-4' : 'w-5 h-5'} text-accent flex-shrink-0 mt-0.5`} />
+                  <div className="min-w-0">
+                    <p className={`${wifiUiEnabled ? 'text-sm' : 'text-base'} font-medium text-foreground leading-snug`}>
+                      Bluetooth Connectivity
+                    </p>
+                    <p className={`${wifiUiEnabled ? 'text-[11px]' : 'text-xs'} text-muted-foreground leading-snug`}>
+                      Web Bluetooth SPP
                     </p>
                   </div>
                 </div>
-
-                {/* Auto-Shutoff Toggle — UI retained; feature not on device yet */}
-                <div className="mt-8 pt-8 border-t border-border opacity-70">
-                  <div className="flex items-center justify-between mb-4">
-                    <div className="flex items-center gap-2">
-                      <Power className="w-5 h-5 text-primary" />
-                      <span className="font-medium text-foreground">Auto-Shutoff</span>
+                {wifiSupported === false ? (
+                  <div className="flex items-start gap-3 opacity-70">
+                    <Wifi className="w-4 h-4 text-muted-foreground flex-shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-foreground leading-snug">Wi-Fi Connectivity</p>
+                      <p className="text-[11px] text-muted-foreground leading-snug">
+                        Not available on this firmware
+                      </p>
                     </div>
-                    <button
-                      type="button"
-                      disabled
-                      aria-disabled="true"
-                      title="Not available on device yet"
-                      className="relative inline-flex h-8 w-14 cursor-not-allowed items-center rounded-full bg-gray-300 opacity-60"
-                    >
-                      <span className="inline-block h-6 w-6 translate-x-1 transform rounded-full bg-white" />
-                    </button>
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    Auto-shutoff disabled — not available on device yet
+                ) : (
+                  wifiUiEnabled && (
+                    <div className="flex items-start gap-3">
+                      <Wifi className="w-4 h-4 text-accent flex-shrink-0 mt-0.5" />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-foreground leading-snug">Wi-Fi Connectivity</p>
+                        <p className="text-[11px] text-muted-foreground leading-snug">Same-LAN HTTP dataplane</p>
+                      </div>
+                    </div>
+                  )
+                )}
+                <div className="flex items-start gap-3">
+                  <Zap className={`${wifiUiEnabled ? 'w-4 h-4' : 'w-5 h-5'} text-accent flex-shrink-0 mt-0.5`} />
+                  <div className="min-w-0">
+                    <p className={`${wifiUiEnabled ? 'text-sm' : 'text-base'} font-medium text-foreground leading-snug`}>
+                      Motor Control
+                    </p>
+                    <p className={`${wifiUiEnabled ? 'text-[11px]' : 'text-xs'} text-muted-foreground leading-snug`}>
+                      PWM Speed Regulation
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <CheckCircle2 className={`${wifiUiEnabled ? 'w-4 h-4' : 'w-5 h-5'} text-accent flex-shrink-0 mt-0.5`} />
+                  <div className="min-w-0">
+                    <p className={`${wifiUiEnabled ? 'text-sm' : 'text-base'} font-medium text-foreground leading-snug`}>
+                      Anomaly Detection Active Sign
+                    </p>
+                    <p className={`${wifiUiEnabled ? 'text-[11px]' : 'text-xs'} text-muted-foreground leading-snug`}>
+                      AI/ML Edge Processing
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 pt-4 border-t border-border space-y-2.5 shrink-0 relative z-10">
+                {!connected ? (
+                  <>
+                    <Button
+                      type="button"
+                      onClick={() => void connectBluetooth()}
+                      disabled={!bluetoothSupported || switching}
+                      className="w-full tech-button bg-accent hover:bg-accent/90 text-accent-foreground"
+                    >
+                      <Bluetooth className="w-4 h-4 mr-2" />
+                      Connect over BLE
+                    </Button>
+                    {wifiUiEnabled && (
+                      <>
+                        <Button
+                          type="button"
+                          onClick={openWifiDirectDialog}
+                          disabled={switching}
+                          variant="outline"
+                          className="w-full tech-button"
+                        >
+                          <Wifi className="w-4 h-4 mr-2" />
+                          Connect over Wi-Fi
+                        </Button>
+                        <p className="text-xs text-muted-foreground text-center">
+                          Use Wi-Fi if the device is already on your LAN (enter its IP).
+                        </p>
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="flex rounded-lg border border-border overflow-hidden">
+                      <button
+                        type="button"
+                        disabled={switching || transport === 'ble'}
+                        onClick={() => void switchToBle()}
+                        className={`flex-1 px-3 py-2 text-sm font-medium ${
+                          transport === 'ble'
+                            ? 'bg-primary text-primary-foreground'
+                            : 'bg-white text-foreground hover:bg-secondary'
+                        } disabled:opacity-60`}
+                      >
+                        <Bluetooth className="w-3.5 h-3.5 inline mr-1" />
+                        BLE
+                      </button>
+                      {wifiUiEnabled && (
+                        <button
+                          type="button"
+                          disabled={switching || transport === 'wifi'}
+                          onClick={() => {
+                            if (transport === 'ble') {
+                              openWifiProvisionDialog();
+                            } else {
+                              openWifiDirectDialog();
+                            }
+                          }}
+                          className={`flex-1 px-3 py-2 text-sm font-medium border-l border-border ${
+                            transport === 'wifi'
+                              ? 'bg-primary text-primary-foreground'
+                              : 'bg-white text-foreground hover:bg-secondary'
+                          } disabled:opacity-60`}
+                        >
+                          <Wifi className="w-3.5 h-3.5 inline mr-1" />
+                          Wi-Fi
+                        </button>
+                      )}
+                    </div>
+                    {wifiUiEnabled && transport === 'ble' && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="w-full"
+                        disabled={switching}
+                        onClick={openWifiProvisionDialog}
+                      >
+                        Configure / switch to Wi-Fi…
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      onClick={disconnectBluetooth}
+                      variant="outline"
+                      className="w-full tech-button"
+                      disabled={switching}
+                    >
+                      Disconnect
+                    </Button>
+                  </>
+                )}
+                <p
+                  className={`text-xs text-center font-medium ${
+                    connected ? 'text-green-700' : 'text-muted-foreground'
+                  }`}
+                >
+                  {connected
+                    ? transport === 'wifi'
+                      ? 'Wi-Fi Connected'
+                      : 'BLE Connected'
+                    : connectionStatus}
+                </p>
+              </div>
+            </div>
+
+            {/* Fan Control */}
+            <div className="bg-white rounded-xl p-6 shadow-sm border border-border flex flex-col w-full h-full min-h-0">
+              <h2 className="text-lg font-bold text-primary mb-4 text-center">Fan Control</h2>
+              <div className="space-y-2.5 flex-1">
+                <button
+                  onClick={() => setMotorMode('stop')}
+                  disabled={!connected}
+                  className={`w-full tech-button py-3 rounded-lg text-sm font-semibold transition-all ${
+                    currentMode === 'stop'
+                      ? 'bg-gray-500 text-white shadow-md'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  ⏹ Stop
+                </button>
+                <button
+                  onClick={() => setMotorMode('default')}
+                  disabled={!connected}
+                  className={`w-full tech-button py-3 rounded-lg text-sm font-semibold transition-all ${
+                    currentMode === 'default'
+                      ? 'bg-green-500 text-white shadow-md'
+                      : 'bg-green-100 text-green-700 hover:bg-green-200'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  🌀 Default (100 rad/s)
+                </button>
+                <button
+                  onClick={() => setMotorMode('fast')}
+                  disabled={!connected}
+                  className={`w-full tech-button py-3 rounded-lg text-sm font-semibold transition-all ${
+                    currentMode === 'fast'
+                      ? 'bg-accent text-accent-foreground shadow-md'
+                      : 'bg-accent/10 text-accent hover:bg-accent/20'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  ⚡ Fast (250 rad/s)
+                </button>
+                <div
+                  className={`rounded-lg border p-2.5 transition-all ${
+                    currentMode === 'custom'
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border bg-secondary/30'
+                  }`}
+                >
+                  <label
+                    htmlFor="custom-speed-test"
+                    className="mb-1.5 block text-[11px] font-medium text-muted-foreground"
+                  >
+                    Custom speed (rad/s)
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      id="custom-speed-test"
+                      type="number"
+                      min={MOTOR_SPEED_MIN_RAD_S}
+                      max={MOTOR_SPEED_MAX_RAD_S}
+                      step={1}
+                      value={customSpeedInput}
+                      onChange={(e) => setCustomSpeedInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          void setCustomSpeed();
+                        }
+                      }}
+                      disabled={!connected}
+                      className="w-full rounded-md border border-border bg-white px-3 py-2 font-mono text-sm text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
+                      placeholder="e.g. 100 or -100"
+                    />
+                    <Button
+                      onClick={() => void setCustomSpeed()}
+                      disabled={!connected}
+                      size="sm"
+                      className="shrink-0 h-9 tech-button bg-primary hover:bg-primary/90 text-primary-foreground"
+                    >
+                      Set
+                    </Button>
+                  </div>
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    Range {MOTOR_SPEED_MIN_RAD_S}–{MOTOR_SPEED_MAX_RAD_S} rad/s (negative = reverse)
                   </p>
+                </div>
+              </div>
+              <div className="mt-auto pt-2 border-t border-border opacity-70">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <Power className="w-3.5 h-3.5 text-primary shrink-0" />
+                    <span className="text-xs font-medium text-foreground">Auto-Shutoff</span>
+                    <span className="text-[10px] text-muted-foreground">Off</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled
+                    aria-disabled="true"
+                    title="Not available on device yet"
+                    className="relative inline-flex h-5 w-9 cursor-not-allowed items-center rounded-full bg-gray-300 opacity-60"
+                  >
+                    <span className="inline-block h-3.5 w-3.5 translate-x-0.5 transform rounded-full bg-white" />
+                  </button>
                 </div>
               </div>
             </div>
 
-            {/* Right: Telemetry Display — driven by BLE notifications after connect */}
-            <div className="lg:col-span-1">
-              <div className="bg-white rounded-xl p-8 shadow-sm border border-border">
-                <h2 className="text-lg font-bold text-primary mb-6 text-center">Real-Time Telemetry</h2>
-                <div className="mb-6 flex items-center justify-center gap-2 text-xs font-medium">
-                  {connected && telemetryLive ? (
-                    <>
-                      <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                      <span className="text-green-700">Live via {telemetrySource}</span>
-                    </>
-                  ) : connected ? (
-                    <>
-                      <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                      <span className="text-amber-700">
-                        Waiting for {telemetrySource} telemetry…
-                      </span>
-                    </>
-                  ) : (
-                    <span className="text-muted-foreground">Connect to stream telemetry</span>
-                  )}
-                </div>
+            <div className="min-h-0 h-full overflow-hidden">
+              <SerialTerminal
+                title="SiWG917 Serial"
+                defaultBaudRate={115200}
+                className="h-full max-h-full"
+              />
+            </div>
 
-                {/* Status Indicator */}
-                <div className="mb-8">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-sm font-medium text-muted-foreground">Motor Status</span>
-                    <div className={`status-led ${motorState.status !== 'Stop' ? 'active' : ''} ${
+            <SpeedCompareChart
+              data={speedHistory}
+              commandedSpeed={commandedSpeed}
+              className="min-h-0 h-full"
+            />
+          </div>
+
+          {/* Right: Real-Time Telemetry (full height of left 2 rows) */}
+          <div className="min-h-0">
+            <div className="bg-white rounded-xl p-8 shadow-sm border border-border h-full flex flex-col">
+              <h2 className="text-lg font-bold text-primary mb-6 text-center">Real-Time Telemetry</h2>
+              <div className="mb-6 flex items-center justify-center gap-2 text-xs font-medium">
+                {connected && telemetryLive ? (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                    <span className="text-green-700">Live via {telemetrySource}</span>
+                  </>
+                ) : connected ? (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                    <span className="text-amber-700">
+                      Waiting for {telemetrySource} telemetry…
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground">Connect to stream telemetry</span>
+                )}
+              </div>
+
+              <MotorVisualizer
+                speedRadPerSec={telemetryLive ? motorState.speed : 0}
+                rpm={telemetryLive ? motorState.rpm : 0}
+                active={telemetryLive}
+                anomaly={telemetryLive ? motorState.anomaly : 'NORMAL'}
+              />
+
+              <div className="mb-8">
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-medium text-muted-foreground">Motor Status</span>
+                  <div
+                    className={`status-led ${motorState.status !== 'Stop' ? 'active' : ''} ${
                       motorState.status === 'Error'
                         ? 'bg-destructive'
                         : motorState.status === 'Running'
                           ? 'bg-green-500'
                           : 'bg-muted'
-                    }`} />
-                  </div>
-                  <p className="text-2xl font-bold text-primary">
-                    {telemetryLive ? motorState.status : '—'}
+                    }`}
+                  />
+                </div>
+                <p className="text-2xl font-bold text-primary">
+                  {telemetryLive ? motorState.status : '—'}
+                </p>
+              </div>
+
+              <div className="mb-8">
+                <p className="text-sm font-medium text-muted-foreground mb-2">Speed</p>
+                <div className="bg-secondary/50 rounded-lg p-4">
+                  <p className="text-3xl font-mono font-bold text-accent">
+                    {telemetryLive ? `${motorState.rpm.toFixed(0)} RPM` : '— RPM'}
                   </p>
-                </div>
-
-                {/* Speed Display */}
-                <div className="mb-8">
-                  <p className="text-sm font-medium text-muted-foreground mb-2">Speed</p>
-                  <div className="bg-secondary/50 rounded-lg p-4">
-                    <p className="text-3xl font-mono font-bold text-accent">
-                      {telemetryLive ? `${motorState.rpm.toFixed(0)} RPM` : '— RPM'}
-                    </p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {telemetryLive ? `${motorState.speed.toFixed(2)} rad/s` : '— rad/s'}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Anomaly Detection */}
-                <div className="mb-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-sm font-medium text-muted-foreground">Anomaly Detection</span>
-                    <div
-                      className={`status-led ${
-                        !telemetryLive
-                          ? 'bg-muted'
-                          : motorState.anomaly === 'BLOCKED'
-                            ? 'bg-red-500 active'
-                            : motorState.anomaly === 'SLOWED'
-                              ? 'bg-yellow-500 active'
-                              : 'bg-green-500'
-                      }`}
-                    />
-                  </div>
-
-                  <div className="bg-secondary/50 rounded-lg p-4 mb-3">
-                    <p
-                      className={`text-2xl font-bold tracking-wide ${
-                        !telemetryLive
-                          ? 'text-muted-foreground'
-                          : motorState.anomaly === 'BLOCKED'
-                            ? 'text-red-600'
-                            : motorState.anomaly === 'SLOWED'
-                              ? 'text-yellow-600'
-                              : 'text-green-600'
-                      }`}
-                    >
-                      {telemetryLive ? motorState.anomaly : '—'}
-                    </p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {!telemetryLive
-                        ? 'Pending telemetry'
-                        : anomalyLabel(motorState.anomaly)}
-                    </p>
-                  </div>
-
-                  <p className="text-xs text-muted-foreground">
-                    {!telemetryLive
-                      ? transport === 'wifi'
-                        ? 'Telemetry starts when Wi-Fi delivers Motor: frames'
-                        : 'Telemetry starts when BLE notifications deliver Motor: frames'
-                      : motorState.anomaly === 'NORMAL'
-                        ? '✓ Normal Operation'
-                        : motorState.anomaly === 'SLOWED'
-                          ? '⚠️ Fan running slower than expected'
-                          : '⛔ Fan blocked or stalled'}
-                  </p>
-                </div>
-
-                {/* Last Update */}
-                <div className="pt-4 border-t border-border">
-                  <p className="text-xs text-muted-foreground">
-                    Last update:{' '}
-                    {telemetryLive
-                      ? new Date(motorState.timestamp).toLocaleTimeString()
-                      : '—'}
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {telemetryLive ? `${motorState.speed.toFixed(2)} rad/s` : '— rad/s'}
                   </p>
                 </div>
               </div>
+
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-medium text-muted-foreground">Anomaly Detection</span>
+                  <div
+                    className={`status-led ${
+                      !telemetryLive
+                        ? 'bg-muted'
+                        : motorState.anomaly === 'BLOCKED'
+                          ? 'bg-red-500 active'
+                          : motorState.anomaly === 'SLOWED'
+                            ? 'bg-yellow-500 active'
+                            : 'bg-green-500'
+                    }`}
+                  />
+                </div>
+                <div className="bg-secondary/50 rounded-lg p-4 mb-3">
+                  <p
+                    className={`text-2xl font-bold tracking-wide ${
+                      !telemetryLive
+                        ? 'text-muted-foreground'
+                        : motorState.anomaly === 'BLOCKED'
+                          ? 'text-red-600'
+                          : motorState.anomaly === 'SLOWED'
+                            ? 'text-yellow-600'
+                            : 'text-green-600'
+                    }`}
+                  >
+                    {telemetryLive ? motorState.anomaly : '—'}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {!telemetryLive ? 'Pending telemetry' : anomalyLabel(motorState.anomaly)}
+                  </p>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {!telemetryLive
+                    ? transport === 'wifi'
+                      ? 'Telemetry starts when Wi-Fi delivers Motor: frames'
+                      : 'Telemetry starts when BLE notifications deliver Motor: frames'
+                    : motorState.anomaly === 'NORMAL'
+                      ? '✓ Normal Operation'
+                      : motorState.anomaly === 'SLOWED'
+                        ? '⚠️ Fan running slower than expected'
+                        : '⛔ Fan blocked or stalled'}
+                </p>
+              </div>
+
+              <div className="mt-auto pt-4 border-t border-border">
+                <p className="text-xs text-muted-foreground">
+                  Last update:{' '}
+                  {telemetryLive ? new Date(motorState.timestamp).toLocaleTimeString() : '—'}
+                </p>
+              </div>
             </div>
           </div>
+        </div>
+        ) : (
+        /* ——— Develop Mode: production 3-column layout (Wi-Fi + BLE) ——— */
+        <div className="grid lg:grid-cols-3 gap-8">
+          <div className="lg:col-span-1">
+            <div className="bg-white rounded-xl p-6 shadow-sm border border-border">
+              <h2 className="text-lg font-bold text-primary mb-4">Technology Stack</h2>
+              <div className="space-y-3">
+                <div className="flex items-start gap-3">
+                  <Bluetooth className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-medium text-foreground">Bluetooth Connectivity</p>
+                    <p className="text-xs text-muted-foreground">Web Bluetooth SPP</p>
+                  </div>
+                </div>
+                {wifiSupported === false ? (
+                  <div className="flex items-start gap-3 opacity-70">
+                    <Wifi className="w-5 h-5 text-muted-foreground flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-medium text-foreground">Wi-Fi Connectivity</p>
+                      <p className="text-xs text-muted-foreground">Not available on this firmware</p>
+                    </div>
+                  </div>
+                ) : (
+                  wifiUiEnabled && (
+                    <div className="flex items-start gap-3">
+                      <Wifi className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
+                      <div>
+                        <p className="font-medium text-foreground">Wi-Fi Connectivity</p>
+                        <p className="text-xs text-muted-foreground">Same-LAN HTTP dataplane</p>
+                      </div>
+                    </div>
+                  )
+                )}
+                <div className="flex items-start gap-3">
+                  <Zap className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-medium text-foreground">Motor Control</p>
+                    <p className="text-xs text-muted-foreground">PWM Speed Regulation</p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <CheckCircle2 className="w-5 h-5 text-accent flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-medium text-foreground">Anomaly Detection Active Sign</p>
+                    <p className="text-xs text-muted-foreground">AI/ML Edge Processing</p>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-6 pt-6 border-t border-border space-y-3">
+                {!connected ? (
+                  <>
+                    <Button
+                      onClick={() => void connectBluetooth()}
+                      disabled={!bluetoothSupported || switching}
+                      className="w-full tech-button bg-accent hover:bg-accent/90 text-accent-foreground"
+                    >
+                      <Bluetooth className="w-4 h-4 mr-2" />
+                      Connect over BLE
+                    </Button>
+                    {wifiUiEnabled && (
+                      <>
+                        <Button
+                          onClick={openWifiDirectDialog}
+                          disabled={switching}
+                          variant="outline"
+                          className="w-full tech-button"
+                        >
+                          <Wifi className="w-4 h-4 mr-2" />
+                          Connect over Wi-Fi
+                        </Button>
+                        <p className="text-xs text-muted-foreground">
+                          Use Wi-Fi if the device is already joined to your LAN (enter its IP).
+                        </p>
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="flex rounded-lg border border-border overflow-hidden">
+                      <button
+                        type="button"
+                        disabled={switching || transport === 'ble'}
+                        onClick={() => void switchToBle()}
+                        className={`flex-1 px-3 py-2 text-sm font-medium ${
+                          transport === 'ble'
+                            ? 'bg-primary text-primary-foreground'
+                            : 'bg-white text-foreground hover:bg-secondary'
+                        } disabled:opacity-60`}
+                      >
+                        <Bluetooth className="w-3.5 h-3.5 inline mr-1" />
+                        BLE
+                      </button>
+                      {wifiUiEnabled && (
+                        <button
+                          type="button"
+                          disabled={switching || transport === 'wifi'}
+                          onClick={() => {
+                            if (transport === 'ble') {
+                              openWifiProvisionDialog();
+                            } else {
+                              openWifiDirectDialog();
+                            }
+                          }}
+                          className={`flex-1 px-3 py-2 text-sm font-medium border-l border-border ${
+                            transport === 'wifi'
+                              ? 'bg-primary text-primary-foreground'
+                              : 'bg-white text-foreground hover:bg-secondary'
+                          } disabled:opacity-60`}
+                        >
+                          <Wifi className="w-3.5 h-3.5 inline mr-1" />
+                          Wi-Fi
+                        </button>
+                      )}
+                    </div>
+                    {wifiUiEnabled && transport === 'ble' && (
+                      <Button
+                        variant="outline"
+                        className="w-full"
+                        disabled={switching}
+                        onClick={openWifiProvisionDialog}
+                      >
+                        Configure / switch to Wi-Fi…
+                      </Button>
+                    )}
+                    <Button
+                      onClick={disconnectBluetooth}
+                      variant="outline"
+                      className="w-full tech-button"
+                      disabled={switching}
+                    >
+                      Disconnect
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="lg:col-span-1">
+            <div className="bg-white rounded-xl p-8 shadow-sm border border-border">
+              <h2 className="text-lg font-bold text-primary mb-8 text-center">Fan Control</h2>
+              <div className="space-y-4">
+                <button
+                  onClick={() => setMotorMode('stop')}
+                  disabled={!connected}
+                  className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
+                    currentMode === 'stop'
+                      ? 'bg-gray-500 text-white shadow-lg'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  <span className="text-lg">⏹</span> Stop
+                </button>
+                <button
+                  onClick={() => setMotorMode('default')}
+                  disabled={!connected}
+                  className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
+                    currentMode === 'default'
+                      ? 'bg-green-500 text-white shadow-lg'
+                      : 'bg-green-100 text-green-700 hover:bg-green-200'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  <span className="text-lg">🌀</span> Default (100 rad/s)
+                </button>
+                <button
+                  onClick={() => setMotorMode('fast')}
+                  disabled={!connected}
+                  className={`w-full tech-button py-4 rounded-xl font-semibold transition-all ${
+                    currentMode === 'fast'
+                      ? 'bg-accent text-accent-foreground shadow-lg'
+                      : 'bg-accent/10 text-accent hover:bg-accent/20'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  <span className="text-lg">⚡</span> Fast (250 rad/s)
+                </button>
+                <div
+                  className={`rounded-xl border p-4 transition-all ${
+                    currentMode === 'custom'
+                      ? 'border-primary bg-primary/5 shadow-sm'
+                      : 'border-border bg-secondary/30'
+                  }`}
+                >
+                  <label htmlFor="custom-speed-dev" className="mb-2 block text-sm font-medium text-foreground">
+                    Custom speed (rad/s)
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      id="custom-speed-dev"
+                      type="number"
+                      min={MOTOR_SPEED_MIN_RAD_S}
+                      max={MOTOR_SPEED_MAX_RAD_S}
+                      step={1}
+                      value={customSpeedInput}
+                      onChange={(e) => setCustomSpeedInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          void setCustomSpeed();
+                        }
+                      }}
+                      disabled={!connected}
+                      className="w-full rounded-lg border border-border bg-white px-3 py-2 font-mono text-sm text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
+                      placeholder="e.g. 100 or -100"
+                    />
+                    <Button
+                      onClick={() => void setCustomSpeed()}
+                      disabled={!connected}
+                      className="shrink-0 tech-button bg-primary hover:bg-primary/90 text-primary-foreground"
+                    >
+                      Set
+                    </Button>
+                  </div>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Range {MOTOR_SPEED_MIN_RAD_S}–{MOTOR_SPEED_MAX_RAD_S} rad/s (negative = reverse, M0 = stop)
+                  </p>
+                </div>
+              </div>
+              <div className="mt-8 pt-8 border-t border-border opacity-70">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <Power className="w-5 h-5 text-primary" />
+                    <span className="font-medium text-foreground">Auto-Shutoff</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled
+                    aria-disabled="true"
+                    title="Not available on device yet"
+                    className="relative inline-flex h-8 w-14 cursor-not-allowed items-center rounded-full bg-gray-300 opacity-60"
+                  >
+                    <span className="inline-block h-6 w-6 translate-x-1 transform rounded-full bg-white" />
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Auto-shutoff disabled — not available on device yet
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="lg:col-span-1">
+            <div className="bg-white rounded-xl p-8 shadow-sm border border-border">
+              <h2 className="text-lg font-bold text-primary mb-6 text-center">Real-Time Telemetry</h2>
+              <div className="mb-6 flex items-center justify-center gap-2 text-xs font-medium">
+                {connected && telemetryLive ? (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                    <span className="text-green-700">Live via {telemetrySource}</span>
+                  </>
+                ) : connected ? (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                    <span className="text-amber-700">Waiting for {telemetrySource} telemetry…</span>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground">Connect to stream telemetry</span>
+                )}
+              </div>
+              <div className="mb-8">
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-medium text-muted-foreground">Motor Status</span>
+                  <div
+                    className={`status-led ${motorState.status !== 'Stop' ? 'active' : ''} ${
+                      motorState.status === 'Error'
+                        ? 'bg-destructive'
+                        : motorState.status === 'Running'
+                          ? 'bg-green-500'
+                          : 'bg-muted'
+                    }`}
+                  />
+                </div>
+                <p className="text-2xl font-bold text-primary">
+                  {telemetryLive ? motorState.status : '—'}
+                </p>
+              </div>
+              <div className="mb-8">
+                <p className="text-sm font-medium text-muted-foreground mb-2">Speed</p>
+                <div className="bg-secondary/50 rounded-lg p-4">
+                  <p className="text-3xl font-mono font-bold text-accent">
+                    {telemetryLive ? `${motorState.rpm.toFixed(0)} RPM` : '— RPM'}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {telemetryLive ? `${motorState.speed.toFixed(2)} rad/s` : '— rad/s'}
+                  </p>
+                </div>
+              </div>
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-medium text-muted-foreground">Anomaly Detection</span>
+                  <div
+                    className={`status-led ${
+                      !telemetryLive
+                        ? 'bg-muted'
+                        : motorState.anomaly === 'BLOCKED'
+                          ? 'bg-red-500 active'
+                          : motorState.anomaly === 'SLOWED'
+                            ? 'bg-yellow-500 active'
+                            : 'bg-green-500'
+                    }`}
+                  />
+                </div>
+                <div className="bg-secondary/50 rounded-lg p-4 mb-3">
+                  <p
+                    className={`text-2xl font-bold tracking-wide ${
+                      !telemetryLive
+                        ? 'text-muted-foreground'
+                        : motorState.anomaly === 'BLOCKED'
+                          ? 'text-red-600'
+                          : motorState.anomaly === 'SLOWED'
+                            ? 'text-yellow-600'
+                            : 'text-green-600'
+                    }`}
+                  >
+                    {telemetryLive ? motorState.anomaly : '—'}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {!telemetryLive ? 'Pending telemetry' : anomalyLabel(motorState.anomaly)}
+                  </p>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {!telemetryLive
+                    ? transport === 'wifi'
+                      ? 'Telemetry starts when Wi-Fi delivers Motor: frames'
+                      : 'Telemetry starts when BLE notifications deliver Motor: frames'
+                    : motorState.anomaly === 'NORMAL'
+                      ? '✓ Normal Operation'
+                      : motorState.anomaly === 'SLOWED'
+                        ? '⚠️ Fan running slower than expected'
+                        : '⛔ Fan blocked or stalled'}
+                </p>
+              </div>
+              <div className="pt-4 border-t border-border">
+                <p className="text-xs text-muted-foreground">
+                  Last update:{' '}
+                  {telemetryLive ? new Date(motorState.timestamp).toLocaleTimeString() : '—'}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+        )}
 
         {/* Error Message */}
         {error && (
@@ -1446,7 +1912,7 @@ export default function FanController() {
 
       {/* Wi-Fi connect / provision dialog */}
       {wifiDialogOpen && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-md rounded-xl border border-border bg-white p-6 shadow-lg">
             {wifiDialogMode === 'direct' ? (
               <>
