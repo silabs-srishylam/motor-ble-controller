@@ -123,9 +123,11 @@ export default function FanController() {
    * Develop (default): production 3-column layout with Wi-Fi.
    */
   const [testMode, setTestMode] = useState(false);
-  /** Fan Control setpoint for speed compare chart (rad/s). Device default is 100. */
-  const [commandedSpeed, setCommandedSpeed] = useState(100);
+  /** Fan Control setpoint for speed compare chart (rad/s). */
+  const [commandedSpeed, setCommandedSpeed] = useState(0);
   const [speedHistory, setSpeedHistory] = useState<SpeedHistoryPoint[]>([]);
+  /** Target line only after the user presses Fan Control this session. */
+  const [userSetCommanded, setUserSetCommanded] = useState(false);
 
   const characteristicRef = useRef<any>(null);
   const deviceRef = useRef<BluetoothDevice | null>(null);
@@ -136,7 +138,7 @@ export default function FanController() {
   const errorDismissTimerRef = useRef<number | null>(null);
   /** True while the user (or UI) is intentionally tearing down the link. */
   const intentionalDisconnectRef = useRef(false);
-  const commandedSpeedRef = useRef(100);
+  const commandedSpeedRef = useRef(0);
   const lastChartSampleAtRef = useRef(0);
   const lastChartCommandedRef = useRef(0);
   const wifiStatusWaiterRef = useRef<{
@@ -306,7 +308,8 @@ export default function FanController() {
     setConnectionStatus('Disconnected');
     setCurrentMode('stop');
     setTelemetryLive(false);
-    updateCommandedSpeed(100);
+    setUserSetCommanded(false);
+    updateCommandedSpeed(0);
     clearSpeedHistory();
     setMotorState({
       status: 'Stop',
@@ -967,6 +970,10 @@ export default function FanController() {
 
     // Highlight the pressed control; telemetry panel follows device notify stream.
     setCurrentMode(mode);
+    if (!userSetCommanded) {
+      clearSpeedHistory();
+    }
+    setUserSetCommanded(true);
     updateCommandedSpeed(setpoint);
     clearError();
     await sendCommand(command);
@@ -991,6 +998,10 @@ export default function FanController() {
 
     clearError();
     setCurrentMode(speed === 0 ? 'stop' : 'custom');
+    if (!userSetCommanded) {
+      clearSpeedHistory();
+    }
+    setUserSetCommanded(true);
     updateCommandedSpeed(speed);
     await sendCommand(`M${speed}`);
   };
@@ -1438,6 +1449,7 @@ export default function FanController() {
             <SpeedCompareChart
               data={speedHistory}
               commandedSpeed={commandedSpeed}
+              showTarget={userSetCommanded}
               className="min-h-0 h-full"
             />
           </div>

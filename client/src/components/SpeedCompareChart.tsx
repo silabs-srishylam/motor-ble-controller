@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button';
 export interface SpeedHistoryPoint {
   /** Epoch ms */
   t: number;
-  /** Target setpoint from Fan Control (rad/s) */
+  /** Target setpoint from Fan Control (rad/s); ignored until user sets a command */
   commanded: number;
   /** Actual telemetry speed (rad/s) */
   actual: number;
@@ -23,8 +23,10 @@ export interface SpeedHistoryPoint {
 
 interface SpeedCompareChartProps {
   data: SpeedHistoryPoint[];
-  /** Latest Fan Control target (rad/s), shown in the header */
+  /** Latest Fan Control target (rad/s), shown in the header when showTarget */
   commandedSpeed?: number;
+  /** Hide Target line/header until the user presses Fan Control */
+  showTarget?: boolean;
   className?: string;
 }
 
@@ -34,12 +36,16 @@ function formatTime(t: number) {
 }
 
 /** Zoom Y-axis around live samples so small speed jitter is readable. */
-function yDomainFromData(data: SpeedHistoryPoint[]): [number, number] {
+function yDomainFromData(data: SpeedHistoryPoint[], includeTarget: boolean): [number, number] {
   let min = Infinity;
   let max = -Infinity;
   for (const p of data) {
-    min = Math.min(min, p.commanded, p.actual);
-    max = Math.max(max, p.commanded, p.actual);
+    min = Math.min(min, p.actual);
+    max = Math.max(max, p.actual);
+    if (includeTarget) {
+      min = Math.min(min, p.commanded);
+      max = Math.max(max, p.commanded);
+    }
   }
   if (!Number.isFinite(min) || !Number.isFinite(max)) {
     return [-10, 10];
@@ -67,13 +73,14 @@ function downloadBlob(blob: Blob, filename: string) {
 export const SpeedCompareChart = memo(function SpeedCompareChart({
   data,
   commandedSpeed,
+  showTarget = false,
   className = '',
 }: SpeedCompareChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
   const latestActual = data.length > 0 ? data[data.length - 1].actual : null;
   const yDomain = useMemo(
-    () => (data.length > 0 ? yDomainFromData(data) : undefined),
-    [data]
+    () => (data.length > 0 ? yDomainFromData(data, showTarget) : undefined),
+    [data, showTarget]
   );
 
   const exportChart = useCallback(async () => {
@@ -84,13 +91,18 @@ export const SpeedCompareChart = memo(function SpeedCompareChart({
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 
     // CSV of all samples
-    const csvLines = [
-      'timestamp_iso,target_rad_s,actual_rad_s',
-      ...data.map(
-        (p) =>
-          `${new Date(p.t).toISOString()},${p.commanded.toFixed(4)},${p.actual.toFixed(4)}`
-      ),
-    ];
+    const csvLines = showTarget
+      ? [
+          'timestamp_iso,target_rad_s,actual_rad_s',
+          ...data.map(
+            (p) =>
+              `${new Date(p.t).toISOString()},${p.commanded.toFixed(4)},${p.actual.toFixed(4)}`
+          ),
+        ]
+      : [
+          'timestamp_iso,actual_rad_s',
+          ...data.map((p) => `${new Date(p.t).toISOString()},${p.actual.toFixed(4)}`),
+        ];
     downloadBlob(
       new Blob([csvLines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' }),
       `speed-compare-${stamp}.csv`
@@ -151,7 +163,7 @@ export const SpeedCompareChart = memo(function SpeedCompareChart({
     } finally {
       URL.revokeObjectURL(svgUrl);
     }
-  }, [data]);
+  }, [data, showTarget]);
 
   return (
     <div
@@ -161,16 +173,22 @@ export const SpeedCompareChart = memo(function SpeedCompareChart({
         <div className="min-w-0">
           <h3 className="text-sm font-semibold text-primary">Speed Compare</h3>
           <p className="text-[10px] text-muted-foreground">
-            Target {commandedSpeed != null ? commandedSpeed.toFixed(1) : '—'}
-            {' · '}
+            {showTarget ? (
+              <>
+                Target {commandedSpeed != null ? commandedSpeed.toFixed(1) : '—'}
+                {' · '}
+              </>
+            ) : null}
             Act {latestActual != null ? latestActual.toFixed(1) : '—'} rad/s
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <div className="hidden sm:flex items-center gap-3 text-[10px] text-muted-foreground">
-            <span className="inline-flex items-center gap-1">
-              <span className="w-2 h-0.5 bg-red-500 rounded" /> Target
-            </span>
+            {showTarget ? (
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-0.5 bg-red-500 rounded" /> Target
+              </span>
+            ) : null}
             <span className="inline-flex items-center gap-1">
               <span className="w-2 h-0.5 bg-sky-500 rounded" /> Actual
             </span>
@@ -220,20 +238,29 @@ export const SpeedCompareChart = memo(function SpeedCompareChart({
                   name === 'commanded' ? 'Target' : 'Actual',
                 ]}
               />
-              <Legend
-                wrapperStyle={{ fontSize: 11 }}
-                formatter={(value) => (value === 'commanded' ? 'Target' : 'Actual')}
-              />
-              <Line
-                type="stepAfter"
-                dataKey="commanded"
-                name="commanded"
-                stroke="#ef4444"
-                strokeWidth={2}
-                dot={false}
-                activeDot={false}
-                isAnimationActive={false}
-              />
+              {showTarget ? (
+                <Legend
+                  wrapperStyle={{ fontSize: 11 }}
+                  formatter={(value) => (value === 'commanded' ? 'Target' : 'Actual')}
+                />
+              ) : (
+                <Legend
+                  wrapperStyle={{ fontSize: 11 }}
+                  formatter={() => 'Actual'}
+                />
+              )}
+              {showTarget ? (
+                <Line
+                  type="stepAfter"
+                  dataKey="commanded"
+                  name="commanded"
+                  stroke="#ef4444"
+                  strokeWidth={2}
+                  dot={false}
+                  activeDot={false}
+                  isAnimationActive={false}
+                />
+              ) : null}
               <Line
                 type="linear"
                 dataKey="actual"
