@@ -123,8 +123,8 @@ export default function FanController() {
    * Develop (default): production 3-column layout with Wi-Fi.
    */
   const [testMode, setTestMode] = useState(false);
-  /** Fan Control setpoint for speed compare chart (rad/s). */
-  const [commandedSpeed, setCommandedSpeed] = useState(0);
+  /** Fan Control setpoint for speed compare chart (rad/s). Device default is 100. */
+  const [commandedSpeed, setCommandedSpeed] = useState(100);
   const [speedHistory, setSpeedHistory] = useState<SpeedHistoryPoint[]>([]);
 
   const characteristicRef = useRef<any>(null);
@@ -136,7 +136,7 @@ export default function FanController() {
   const errorDismissTimerRef = useRef<number | null>(null);
   /** True while the user (or UI) is intentionally tearing down the link. */
   const intentionalDisconnectRef = useRef(false);
-  const commandedSpeedRef = useRef(0);
+  const commandedSpeedRef = useRef(100);
   const lastChartSampleAtRef = useRef(0);
   const lastChartCommandedRef = useRef(0);
   const wifiStatusWaiterRef = useRef<{
@@ -306,7 +306,7 @@ export default function FanController() {
     setConnectionStatus('Disconnected');
     setCurrentMode('stop');
     setTelemetryLive(false);
-    updateCommandedSpeed(0);
+    updateCommandedSpeed(100);
     clearSpeedHistory();
     setMotorState({
       status: 'Stop',
