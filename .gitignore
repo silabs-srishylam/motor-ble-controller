@@ -3,7 +3,6 @@
 .pnpm-store/
 
 # Build outputs
-dist/
 build/
 *.dist
 dist-*/
@@ -106,3 +105,6 @@ temp/
 *.db
 *.sqlite
 *.sqlite3
+
+# Local toolchain bootstrap
+.tooling/
