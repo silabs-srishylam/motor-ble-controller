@@ -9,6 +9,7 @@ import type { TransportKind } from '@/lib/transport/types';
 import { WifiHttpTransport } from '@/lib/wifi-transport';
 import { parseWifiStatusLine, type WifiDeviceStatus } from '@/lib/wifi-status';
 import { loadStoredWifiNetworks, saveWifiNetwork, loadStoredDeviceIps, saveDeviceIp, clearAllStoredWifi } from '@/lib/wifi-credentials';
+import { formatWifiConnectCmd, validateWifiCredentials } from '@/lib/wifi-connect-cmd';
 
 // Web Bluetooth API type definitions
 declare global {
@@ -769,9 +770,13 @@ export default function FanController() {
         if (useStored) {
           await sendBleRaw('wifi connect');
         } else {
-          const psk = opts?.password ?? '';
-          await sendBleRaw(`wifi connect ${ssid} ${psk}`);
-          saveWifiNetwork({ ssid, password: opts?.password });
+          const creds = validateWifiCredentials(ssid, opts?.password ?? '');
+          if (!creds.ok) {
+            throw new Error(creds.message);
+          }
+          /* Quote SSID/PSK so multi-word names (e.g. "Sanyi's iPhone") stay one token. */
+          await sendBleRaw(formatWifiConnectCmd(creds.ssid, creds.password));
+          saveWifiNetwork({ ssid: creds.ssid, password: creds.password });
           setStoredNetworks(loadStoredWifiNetworks());
         }
         status = await waitUntilWifiUp(joiningWait);
